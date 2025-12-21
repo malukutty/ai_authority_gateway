@@ -1,0 +1,37 @@
+allowed_envs:
+  - dev
+  - staging
+  - prod
+
+allowed_models:
+  - gpt-4o-mini
+
+allowed_action_types:
+  - read_only
+  - customer_message
+
+deny_in_prod: false
+
+# NEW: cost guardrails
+max_output_tokens: 256           # hard cap on model output tokens
+max_prompt_chars: 12000        # crude prompt size cap (MVP-safe)
+max_cost_usd_per_request: 0.01   # deny if estimated cost exceeds this after usage
+
+# NEW: pricing (USD per 1M tokens)
+pricing:
+  gpt-4o-mini:
+    input_per_1m: 0.15
+    output_per_1m: 0.60
+
+
+
+approval_mode: require_human_approval   # auto_execute | require_human_approval | simulation_only
+
+executable_actions:
+  - customer_message
+  - write_crm
+
+# Optional: per-action overrides (wins over global)
+approval_mode_by_action:
+  customer_message: auto_execute
+  write_crm: require_human_approval

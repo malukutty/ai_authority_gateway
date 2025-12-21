@@ -1,0 +1,14 @@
+﻿{
+  "model": "gpt-4o-mini",
+  "messages": [
+    {"role": "user", "content": "Draft a friendly renewal reminder for the customer."}
+  ],
+  "action_type": "customer_message",
+  "action": {
+    "type": "customer_message",
+    "params": {
+      "to": "customer@example.com",
+      "message": "Hi! Just checking in on your renewal!! Happy to help with anything you need."
+    }
+  }
+}
