@@ -173,8 +173,7 @@ If you are building “AI agents” that can act, this problem will eventually f
 ***Not production-ready (yet)
 This repository is intentionally minimal.***
 
-Persistence, durability, and real executors are future work.
-Those are solvable problems once the control surface is correct.
+
 
 
 If you’ve thought about:
