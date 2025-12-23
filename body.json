@@ -1,14 +1,16 @@
 ﻿{
-  "model": "gpt-4o-mini",
-  "messages": [
-    {"role": "user", "content": "Draft a friendly renewal reminder for the customer."}
-  ],
-  "action_type": "customer_message",
-  "action": {
-    "type": "customer_message",
-    "params": {
-      "to": "customer@example.com",
-      "message": "Hi! Just checking in on your renewal!! Happy to help with anything you need."
-    }
+  "channel": "email",
+  "to": "customer@example.com",
+  "from": "support@yourcompany.com",
+  "subject": "Quick product update",
+  "body": "Hi there! Sharing a quick update: we shipped performance improvements and a new dashboard view. If you have feedback, reply anytime.",
+  "context": {
+    "account_id": "acct_123",
+    "customer_type": "smb"
+  },
+  "source": {
+    "system": "crm",
+    "ai_generated": true,
+    "model": "gpt-4.1"
   }
 }

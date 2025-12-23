@@ -1,0 +1,18 @@
+{
+  "channel": "email",
+  "to": "customer@example.com",
+  "from": "billing@yourcompany.com",
+  "subject": "Your renewal details",
+  "body": "Hi John, your subscription will renew at $12,000 on Oct 1, 2025. If you’d like to make changes before then, reply here.",
+  "context": {
+    "account_id": "acct_999",
+    "customer_type": "enterprise",
+    "contract_value_usd": 12000,
+    "renewal_date": "2025-10-01"
+  },
+  "source": {
+    "system": "crm",
+    "ai_generated": true,
+    "model": "gpt-4.1"
+  }
+}
