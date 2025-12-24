@@ -83,7 +83,7 @@ async def validate_api_key_with_lovable(
     if cached is not None:
         return cached
 
-    url = f"{lovable_base_url}/internal/keys/validate"
+    url = f"{lovable_base_url}/api/internal/keys/validate"
     payload = {"key_hash": key_hash, "env": env_norm}
     headers = {
         "Content-Type": "application/json",
