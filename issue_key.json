@@ -1,0 +1,7 @@
+{
+  "key_prefix": "aia_dev",
+  "allowed_envs": "dev",
+  "requests_per_day": 200,
+  "recipients_per_day": 50,
+  "notes": "first prod key"
+}
