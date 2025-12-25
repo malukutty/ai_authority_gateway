@@ -1,5 +1,6 @@
 {
   "to": "you@example.com",
-  "subject": "Quick hello",
-  "body": "Just testing the gateway."
+  "subject": "Hello",
+  "body": "Testing AICCA sandbox key."
 }
+
