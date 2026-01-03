@@ -1,7 +1,7 @@
 """
 Authority AI Gateway (Path B): Gateway-owned API keys + outbound message authority layer.
 
-Single-file main.py you can run with:
+Run:
   python -m uvicorn main:app --reload
 
 Env vars:
@@ -25,23 +25,27 @@ import uuid
 import secrets
 import hashlib
 import sqlite3
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
+from datetime import datetime, timezone
 
 # ----------------------------
 # App
 # ----------------------------
 
-app = FastAPI(title="Authority AI Gateway", version="0.2-path-b")
+app = FastAPI(title="Authority AI Gateway", version="0.3-path-b")
 
 # ----------------------------
 # DB (SQLite)
 # ----------------------------
 
 DB_PATH = os.getenv("KEYSTORE_DB_PATH", "keystore.db")
+
+# quick in-memory support audit (for debugging)
+SUPPORT_AUDIT_LOG: List[Dict[str, Any]] = []
 
 
 def _conn() -> sqlite3.Connection:
@@ -185,6 +189,64 @@ def idem_put(idem_key: str, endpoint: str, response_obj: Dict[str, Any]) -> None
         conn.close()
 
 
+def _log_support_audit(
+    ticket_id: str,
+    channel: str,
+    decision: str,
+    approval_id: Optional[str],
+    commitment: Dict[str, Any],
+    reasons: List[Dict[str, Any]],
+) -> str:
+    audit_id = f"aud_{uuid.uuid4()}"
+    SUPPORT_AUDIT_LOG.append(
+        {
+            "audit_id": audit_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "type": "support_decide",
+            "ticket_id": ticket_id,
+            "channel": channel,
+            "decision": decision,
+            "approval_id": approval_id,
+            "commitment": commitment,
+            "reasons": reasons,
+        }
+    )
+    return audit_id
+
+
+def create_support_approval(payload: Dict[str, Any]) -> str:
+    approval_id = str(uuid.uuid4())
+    conn = _conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO approvals
+            (approval_id, status, created_at, payload_json, decision, api_key_hash)
+            VALUES (?, 'PENDING', ?, ?, NULL, NULL)
+            """,
+            (
+                approval_id,
+                now_ts(),
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    audit(
+        event="support_approval_created",
+        actor="support_system",
+        env=None,
+        details={
+            "approval_id": approval_id,
+            "ticket_id": payload.get("ticket_id"),
+            "channel": payload.get("channel"),
+        },
+    )
+    return approval_id
+
+
 # ----------------------------
 # Auth
 # ----------------------------
@@ -211,6 +273,7 @@ def require_api_key(
         raise HTTPException(status_code=401, detail="Unauthorized: missing API key.")
 
     key_hash = sha256_hex(raw_key)
+
     conn = _conn()
     try:
         row = conn.execute("SELECT * FROM api_keys WHERE key_hash = ? LIMIT 1", (key_hash,)).fetchone()
@@ -245,7 +308,6 @@ class RevokeKeyRequest(BaseModel):
 
 
 class MessageSendRequest(BaseModel):
-    # Minimal outbound message API
     to: str = Field(..., description="Recipient email")
     subject: str = Field(..., description="Email subject")
     body: str = Field(..., description="Email body (plain text)")
@@ -253,25 +315,52 @@ class MessageSendRequest(BaseModel):
     from_name: Optional[str] = None
 
 
+class SupportDraft(BaseModel):
+    text: str = Field(..., min_length=1, max_length=50_000)
+
+
+class SupportDecideRequest(BaseModel):
+    channel: str = Field(..., min_length=1, max_length=64)
+    ticket_id: str = Field(..., min_length=1, max_length=128)
+    draft: SupportDraft
+    customer: Optional[Dict[str, Any]] = None
+    conversation: Optional[Dict[str, Any]] = None
+
+
+class SupportReason(BaseModel):
+    code: str
+    severity: str
+    evidence: List[str] = []
+
+
+class SuggestedEdit(BaseModel):
+    text: str
+
+
+class SupportDecideResponse(BaseModel):
+    decision: str
+    approval_id: Optional[str] = None
+    reasons: List[SupportReason] = []
+    suggested_edit: SuggestedEdit
+    audit_id: str
+
+
 # ----------------------------
 # Policy: commitment detection + kill switches
 # ----------------------------
 
 COMMITMENT_PATTERNS = [
-    # money / pricing commitments
     r"\b(refund|refunds|credit|credited|free of charge|waive|waived)\b",
     r"\b(discount|discounted|price cut|reduce the price|we will lower)\b",
     r"\b(invoice|payment|paid|charge|charged|billing|bill)\b",
-    r"\bcontract|msa|dpa|sow|purchase order|po\b",
-    # timeline / guarantees
-    r"\bguarantee|guaranteed|we promise|we commit\b",
+    r"\b(contract|msa|dpa|sow|purchase order|po)\b",
+    r"\b(guarantee|guaranteed|we promise|we commit)\b",
     r"\bby (?:tomorrow|eod|end of day|friday|monday|next week)\b",
     r"\bwe will (?:deliver|ship|deploy|fix|resolve)\b",
-    # cancellations / renewals
     r"\b(cancel|cancellation|renewal|renew|terminate|termination)\b",
 ]
 
-_COMMITMENT_REGEX = re.compile("|".join(f"(?:{p})" for p in COMMITMENT_PATTERNS), re.IGNORECASE)
+SAFE_FALLBACK_SUPPORT_REPLY = "Thanks for reaching out. I’m going to get this reviewed and follow up shortly."
 
 
 def detect_commitment(text: str) -> Dict[str, Any]:
@@ -286,27 +375,72 @@ def detect_commitment(text: str) -> Dict[str, Any]:
 
 
 def get_approval_mode(env: str, commitment_sev: str) -> str:
-    # Global mode override
     mode = get_setting("APPROVAL_MODE", "require_human_approval").strip().lower()
     if mode not in ("auto_execute", "require_human_approval", "simulate"):
         mode = "require_human_approval"
 
-    # Safety switches
     if bool_env("KILL_SWITCH", False):
         return "simulate"
 
     if bool_env("DENY_PROD", False) and env == "prod":
         return "require_human_approval"
 
-    # If it's a commitment, default to requiring approval unless explicitly auto_execute
-    if commitment_sev != "NONE" and mode == "auto_execute":
-        # still allow auto_execute if user explicitly chose it
-        return "auto_execute"
-
     if commitment_sev != "NONE" and mode == "simulate":
         return "require_human_approval"
 
     return mode
+
+
+def _normalize_hits(hits: Any) -> List[str]:
+    if hits is None:
+        return []
+    if isinstance(hits, list):
+        out: List[str] = []
+        for h in hits:
+            if isinstance(h, str):
+                out.append(h)
+            elif isinstance(h, dict):
+                out.append(str(h.get("pattern") or h.get("match") or h.get("text") or h))
+            else:
+                out.append(str(h))
+        return out
+    return [str(hits)]
+
+
+def _reasons_from_commitment(commitment: Dict[str, Any]) -> List[SupportReason]:
+    severity = str(commitment.get("severity") or "NONE").upper()
+    hits = _normalize_hits(commitment.get("hits"))
+
+    if severity in ("NONE", "OK", "SAFE"):
+        return []
+
+    joined = " ".join(hits).lower()
+
+    def has_any(words: List[str]) -> bool:
+        return any(w in joined for w in words)
+
+    reasons: List[SupportReason] = []
+
+    if has_any(["refund", "credit", "waive", "free of charge", "no cost"]):
+        reasons.append(SupportReason(code="FINANCIAL_COMMITMENT", severity="HARD", evidence=hits))
+
+    if has_any(["invoice", "billing", "charge", "charged", "payment", "paid", "prorate"]):
+        reasons.append(SupportReason(code="BILLING_CHANGE", severity="HARD", evidence=hits))
+
+    if has_any(["cancel", "cancellation", "renew", "renewal", "terminate", "termination", "contract", "term"]):
+        reasons.append(SupportReason(code="CONTRACTUAL_COMMITMENT", severity="HARD", evidence=hits))
+
+    if not reasons:
+        reasons.append(SupportReason(code="COMMITMENT_DETECTED", severity="HARD", evidence=hits))
+
+    return reasons
+
+
+def _decision_from_commitment(commitment: Dict[str, Any]) -> str:
+    sev = str(commitment.get("severity") or "NONE").upper()
+    if sev in ("NONE", "OK", "SAFE"):
+        return "ALLOW"
+    return "REQUIRE_APPROVAL"
 
 
 # ----------------------------
@@ -390,7 +524,6 @@ def issue_key(req: IssueKeyRequest):
         details={"key_prefix": req.key_prefix, "key_hash_prefix": key_hash[:12], "allowed_envs": req.allowed_envs},
     )
 
-    # raw_key returned ONCE: caller (Lovable admin flow) shows user
     return {
         "api_key": raw_key,
         "key_hash": key_hash,
@@ -436,18 +569,15 @@ async def v1_messages_send(
     if env == "prod" and bool_env("DENY_PROD", False):
         raise HTTPException(status_code=403, detail="Execution denied: production calls are currently blocked.")
 
-    # Idempotency
     if idempotency_key:
         cached = idem_get(f"v1_messages_send::{idempotency_key}")
         if cached is not None:
             return cached
 
-    # Policy check
     text = f"{payload.subject}\n{payload.body}"
     commitment = detect_commitment(text)
     approval_mode = get_approval_mode(env, commitment["severity"])
 
-    # Audit incoming
     audit(
         event="message_send_requested",
         actor=key_rec.get("key_hash", "")[:12],
@@ -462,7 +592,6 @@ async def v1_messages_send(
         },
     )
 
-    # Simulate
     if approval_mode == "simulate":
         resp = {
             "executed": False,
@@ -474,7 +603,6 @@ async def v1_messages_send(
             idem_put(f"v1_messages_send::{idempotency_key}", "/v1/messages/send", resp)
         return resp
 
-    # Require human approval
     if approval_mode == "require_human_approval" and commitment["severity"] != "NONE":
         approval_id = str(uuid.uuid4())
         conn = _conn()
@@ -488,7 +616,7 @@ async def v1_messages_send(
                 (
                     approval_id,
                     now_ts(),
-                    json.dumps(payload.model_dump(), ensure_ascii=False),
+                    json.dumps({"type": "message_send", "message": payload.model_dump()}, ensure_ascii=False),
                     idempotency_key,
                     key_rec.get("key_hash"),
                 ),
@@ -511,7 +639,6 @@ async def v1_messages_send(
             idem_put(f"v1_messages_send::{idempotency_key}", "/v1/messages/send", resp)
         return resp
 
-    # Auto execute (or require_human_approval with NONE)
     result = await send_via_resend(payload)
     resp = {
         "executed": bool(result.get("executed", False)),
@@ -533,6 +660,81 @@ async def v1_messages_send(
     return resp
 
 
+@app.post("/v1/support/messages/decide", response_model=SupportDecideResponse)
+def support_messages_decide(
+    req: SupportDecideRequest,
+    request: Request,
+    key_rec: Dict[str, Any] = Depends(require_api_key),
+    x_env: Optional[str] = Header(default="dev", alias="X-Env"),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    env = (x_env or "dev").strip().lower()
+
+    if idempotency_key:
+        cached = idem_get(f"support_decide::{idempotency_key}")
+        if cached is not None:
+            return cached
+
+    # Detect -> Explain -> Decide
+    commitment = detect_commitment(req.draft.text)
+    reasons_models = _reasons_from_commitment(commitment)
+    reasons_dicts = [r.model_dump() for r in reasons_models]
+    decision = _decision_from_commitment(commitment)
+
+    # Create approval if needed (support approvals are system-originated)
+    approval_id: Optional[str] = None
+    if decision == "REQUIRE_APPROVAL":
+        approval_payload = {
+            "type": "support_message",
+            "env": env,
+            "ticket_id": req.ticket_id,
+            "channel": req.channel,
+            "draft": req.draft.text,
+            "commitment": commitment,
+            "reasons": reasons_dicts,
+        }
+        approval_id = create_support_approval(approval_payload)
+
+    # Log to support audit (in-memory) + durable audit log
+    audit_id = _log_support_audit(
+        ticket_id=req.ticket_id,
+        channel=req.channel,
+        decision=decision,
+        approval_id=approval_id,
+        commitment=commitment,
+        reasons=reasons_dicts,
+    )
+
+    audit(
+        event="support_decide",
+        actor=key_rec.get("key_hash", "")[:12],
+        env=env,
+        details={
+            "ticket_id": req.ticket_id,
+            "channel": req.channel,
+            "decision": decision,
+            "approval_id": approval_id,
+            "commitment": commitment,
+            "reasons": reasons_dicts,
+            "idempotency_key": idempotency_key,
+            "audit_id": audit_id,
+        },
+    )
+
+    resp_model = SupportDecideResponse(
+        decision=decision,
+        approval_id=approval_id,
+        reasons=reasons_models,
+        suggested_edit=SuggestedEdit(text=SAFE_FALLBACK_SUPPORT_REPLY),
+        audit_id=audit_id,
+    )
+
+    if idempotency_key:
+        idem_put(f"support_decide::{idempotency_key}", "/v1/support/messages/decide", resp_model.model_dump())
+
+    return resp_model
+
+
 @app.post("/admin/approvals/{approval_id}/approve", dependencies=[Depends(require_admin)])
 async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev", alias="X-Env")):
     env = (x_env or "dev").strip().lower()
@@ -549,39 +751,93 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
         if row["status"] != "PENDING":
             return {"ok": True, "status": row["status"], "note": "Already decided."}
 
-        payload = json.loads(row["payload_json"])
-        msg = MessageSendRequest(**payload)
+        payload = json.loads(row["payload_json"] or "{}")
+        payload_type = payload.get("type")
 
-        # Execute send
-        result = await send_via_resend(msg)
+        # Case A: message_send approval => execute send
+        if payload_type == "message_send":
+            msg_obj = payload.get("message") or {}
+            msg = MessageSendRequest(**msg_obj)
+            result = await send_via_resend(msg)
 
+            conn.execute(
+                "UPDATE approvals SET status='APPROVED', decided_at=?, decision='APPROVE' WHERE approval_id=?",
+                (now_ts(), approval_id),
+            )
+            conn.commit()
+
+            audit(
+                event="approval_approved",
+                actor="admin",
+                env=env,
+                details={"approval_id": approval_id, "type": "message_send", "provider": result.get("provider")},
+            )
+
+            return {
+                "ok": True,
+                "approval_id": approval_id,
+                "status": "APPROVED",
+                "type": "message_send",
+                "executed": bool(result.get("executed", False)),
+                "provider": result.get("provider"),
+                "provider_result": result,
+            }
+
+        # Case B: support_message approval => mark approved only (decision gate)
+        if payload_type == "support_message":
+            conn.execute(
+                "UPDATE approvals SET status='APPROVED', decided_at=?, decision='APPROVE' WHERE approval_id=?",
+                (now_ts(), approval_id),
+            )
+            conn.commit()
+
+            audit(
+                event="approval_approved",
+                actor="admin",
+                env=env,
+                details={"approval_id": approval_id, "type": "support_message"},
+            )
+
+            return {
+                "ok": True,
+                "approval_id": approval_id,
+                "status": "APPROVED",
+                "type": "support_message",
+                "executed": True,
+                "provider": "none",
+                "provider_result": {"message": "Support decision approved (no external side effects)."},
+            }
+
+        # Unknown payload type
         conn.execute(
             "UPDATE approvals SET status='APPROVED', decided_at=?, decision='APPROVE' WHERE approval_id=?",
             (now_ts(), approval_id),
         )
         conn.commit()
+
+        audit(
+            event="approval_approved",
+            actor="admin",
+            env=env,
+            details={"approval_id": approval_id, "type": "unknown"},
+        )
+        return {
+            "ok": True,
+            "approval_id": approval_id,
+            "status": "APPROVED",
+            "type": "unknown",
+            "note": "Approved unknown approval type. No execution performed.",
+        }
     finally:
         conn.close()
 
-    audit(
-        event="approval_approved",
-        actor="admin",
-        env=env,
-        details={"approval_id": approval_id, "provider": result.get("provider")},
-    )
-
-    return {
-        "ok": True,
-        "approval_id": approval_id,
-        "status": "APPROVED",
-        "executed": bool(result.get("executed", False)),
-        "provider": result.get("provider"),
-        "provider_result": result,
-    }
-
 
 @app.post("/admin/approvals/{approval_id}/reject", dependencies=[Depends(require_admin)])
-def reject(approval_id: str, reason: Optional[str] = None, x_env: Optional[str] = Header(default="dev", alias="X-Env")):
+def reject(
+    approval_id: str,
+    reason: Optional[str] = None,
+    x_env: Optional[str] = Header(default="dev", alias="X-Env"),
+):
     env = (x_env or "dev").strip().lower()
 
     conn = _conn()
@@ -601,17 +857,17 @@ def reject(approval_id: str, reason: Optional[str] = None, x_env: Optional[str] 
             (now_ts(), reason or "", approval_id),
         )
         conn.commit()
+
+        audit(
+            event="approval_rejected",
+            actor="admin",
+            env=env,
+            details={"approval_id": approval_id, "reason": reason or ""},
+        )
+
+        return {"ok": True, "approval_id": approval_id, "status": "REJECTED", "reason": reason or ""}
     finally:
         conn.close()
-
-    audit(
-        event="approval_rejected",
-        actor="admin",
-        env=env,
-        details={"approval_id": approval_id, "reason": reason or ""},
-    )
-
-    return {"ok": True, "approval_id": approval_id, "status": "REJECTED", "reason": reason or ""}
 
 
 @app.get("/admin/audit/recent", dependencies=[Depends(require_admin)])
@@ -637,3 +893,9 @@ def audit_recent(limit: int = 50):
         return {"items": out}
     finally:
         conn.close()
+
+
+@app.get("/admin/support/audit/recent", dependencies=[Depends(require_admin)])
+def support_audit_recent(limit: int = 20):
+    limit = max(1, min(limit, 200))
+    return list(reversed(SUPPORT_AUDIT_LOG[-limit:]))

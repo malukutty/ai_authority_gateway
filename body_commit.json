@@ -1,0 +1,5 @@
+﻿{
+  "to": "customer@example.com",
+  "subject": "Renewal",
+  "body": "We will issue a refund and waive the next invoice."
+}
