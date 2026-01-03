@@ -25,7 +25,7 @@ import uuid
 import secrets
 import hashlib
 import sqlite3
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
@@ -36,16 +36,13 @@ from datetime import datetime, timezone
 # App
 # ----------------------------
 
-app = FastAPI(title="Authority AI Gateway", version="0.3-path-b")
+app = FastAPI(title="Authority AI Gateway", version="0.4-path-b")
 
 # ----------------------------
 # DB (SQLite)
 # ----------------------------
 
 DB_PATH = os.getenv("KEYSTORE_DB_PATH", "keystore.db")
-
-# quick in-memory support audit (for debugging)
-SUPPORT_AUDIT_LOG: List[Dict[str, Any]] = []
 
 
 def _conn() -> sqlite3.Connection:
@@ -91,6 +88,7 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_approvals_created ON approvals(created_at)")
 
         conn.execute(
             """
@@ -189,62 +187,14 @@ def idem_put(idem_key: str, endpoint: str, response_obj: Dict[str, Any]) -> None
         conn.close()
 
 
-def _log_support_audit(
-    ticket_id: str,
-    channel: str,
-    decision: str,
-    approval_id: Optional[str],
-    commitment: Dict[str, Any],
-    reasons: List[Dict[str, Any]],
-) -> str:
-    audit_id = f"aud_{uuid.uuid4()}"
-    SUPPORT_AUDIT_LOG.append(
-        {
-            "audit_id": audit_id,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "type": "support_decide",
-            "ticket_id": ticket_id,
-            "channel": channel,
-            "decision": decision,
-            "approval_id": approval_id,
-            "commitment": commitment,
-            "reasons": reasons,
-        }
-    )
-    return audit_id
-
-
-def create_support_approval(payload: Dict[str, Any]) -> str:
-    approval_id = str(uuid.uuid4())
-    conn = _conn()
+def _parse_json(s: Optional[str]) -> Dict[str, Any]:
+    if not s:
+        return {}
     try:
-        conn.execute(
-            """
-            INSERT INTO approvals
-            (approval_id, status, created_at, payload_json, decision, api_key_hash)
-            VALUES (?, 'PENDING', ?, ?, NULL, NULL)
-            """,
-            (
-                approval_id,
-                now_ts(),
-                json.dumps(payload, ensure_ascii=False),
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    audit(
-        event="support_approval_created",
-        actor="support_system",
-        env=None,
-        details={
-            "approval_id": approval_id,
-            "ticket_id": payload.get("ticket_id"),
-            "channel": payload.get("channel"),
-        },
-    )
-    return approval_id
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {"_": obj}
+    except Exception:
+        return {"_raw": s}
 
 
 # ----------------------------
@@ -339,40 +289,78 @@ class SuggestedEdit(BaseModel):
 
 class SupportDecideResponse(BaseModel):
     decision: str
+    decision_explainer: str
     approval_id: Optional[str] = None
     reasons: List[SupportReason] = []
     suggested_edit: SuggestedEdit
     audit_id: str
 
 
+class SupportApprovalStatusResponse(BaseModel):
+    approval_id: str
+    status: str
+    decision: Optional[str] = None
+    ticket_id: Optional[str] = None
+    channel: Optional[str] = None
+    env: Optional[str] = None
+    reasons: List[SupportReason] = []
+    commitment: Dict[str, Any] = {}
+    decision_explainer: str
+    suggested_edit: SuggestedEdit
+
+
 # ----------------------------
 # Policy: commitment detection + kill switches
 # ----------------------------
 
-COMMITMENT_PATTERNS = [
-    r"\b(refund|refunds|credit|credited|free of charge|waive|waived)\b",
-    r"\b(discount|discounted|price cut|reduce the price|we will lower)\b",
-    r"\b(invoice|payment|paid|charge|charged|billing|bill)\b",
-    r"\b(contract|msa|dpa|sow|purchase order|po)\b",
-    r"\b(guarantee|guaranteed|we promise|we commit)\b",
-    r"\bby (?:tomorrow|eod|end of day|friday|monday|next week)\b",
-    r"\bwe will (?:deliver|ship|deploy|fix|resolve)\b",
-    r"\b(cancel|cancellation|renewal|renew|terminate|termination)\b",
-]
+# v0.4 improvement:
+# - keep regex patterns for detection
+# - but return evidence as human keywords/snippets, not raw regex strings
 
+# (reason_code, regex)
+COMMITMENT_RULES: List[Tuple[str, str]] = [
+    ("FINANCIAL_COMMITMENT", r"\b(refund|refunds|credit|credited|free of charge|waive|waived)\b"),
+    ("BILLING_CHANGE", r"\b(invoice|payment|paid|charge|charged|billing|bill|prorate)\b"),
+    ("PRICING_CHANGE", r"\b(discount|discounted|price cut|reduce the price|we will lower)\b"),
+    ("CONTRACTUAL_COMMITMENT", r"\b(contract|msa|dpa|sow|purchase order|po|renewal|renew|terminate|termination|cancel|cancellation)\b"),
+    ("TIMELINE_GUARANTEE", r"\b(guarantee|guaranteed|we promise|we commit)\b|\bby (?:tomorrow|eod|end of day|friday|monday|next week)\b|\bwe will (?:deliver|ship|deploy|fix|resolve)\b"),
+]
 
 SAFE_FALLBACK_SUPPORT_REPLY = "Thanks for reaching out. I'm going to get this reviewed and follow up shortly."
 
 
-def detect_commitment(text: str) -> Dict[str, Any]:
+def _extract_evidence(text: str, max_items: int = 8) -> List[str]:
+    """
+    Return short human evidence strings like:
+      - "refund"
+      - "waive"
+      - "invoice"
+    (Not regex patterns.)
+    """
+    if not text:
+        return []
+    t = text
     hits: List[str] = []
-    for p in COMMITMENT_PATTERNS:
-        if re.search(p, text or "", re.IGNORECASE):
-            hits.append(p)
-    severity = "NONE"
-    if hits:
-        severity = "HARD_COMMITMENT"
-    return {"severity": severity, "hits": hits}
+    seen = set()
+    for _, pattern in COMMITMENT_RULES:
+        for m in re.finditer(pattern, t, flags=re.IGNORECASE):
+            s = (m.group(0) or "").strip()
+            if not s:
+                continue
+            s_norm = s.lower()
+            if s_norm in seen:
+                continue
+            seen.add(s_norm)
+            hits.append(s)
+            if len(hits) >= max_items:
+                return hits
+    return hits
+
+
+def detect_commitment(text: str) -> Dict[str, Any]:
+    evidence = _extract_evidence(text)
+    severity = "HARD_COMMITMENT" if evidence else "NONE"
+    return {"severity": severity, "hits": evidence}
 
 
 def get_approval_mode(env: str, commitment_sev: str) -> str:
@@ -422,14 +410,20 @@ def _reasons_from_commitment(commitment: Dict[str, Any]) -> List[SupportReason]:
 
     reasons: List[SupportReason] = []
 
-    if has_any(["refund", "credit", "waive", "free of charge", "no cost"]):
+    if has_any(["refund", "refunds", "credit", "credited", "waive", "free of charge"]):
         reasons.append(SupportReason(code="FINANCIAL_COMMITMENT", severity="HARD", evidence=hits))
 
-    if has_any(["invoice", "billing", "charge", "charged", "payment", "paid", "prorate"]):
+    if has_any(["invoice", "billing", "bill", "charge", "charged", "payment", "paid", "prorate"]):
         reasons.append(SupportReason(code="BILLING_CHANGE", severity="HARD", evidence=hits))
 
-    if has_any(["cancel", "cancellation", "renew", "renewal", "terminate", "termination", "contract", "term"]):
+    if has_any(["discount", "discounted", "price cut", "reduce the price", "lower"]):
+        reasons.append(SupportReason(code="PRICING_CHANGE", severity="HARD", evidence=hits))
+
+    if has_any(["cancel", "cancellation", "renew", "renewal", "terminate", "termination", "contract", "msa", "dpa", "sow", "po"]):
         reasons.append(SupportReason(code="CONTRACTUAL_COMMITMENT", severity="HARD", evidence=hits))
+
+    if has_any(["guarantee", "guaranteed", "promise", "commit", "tomorrow", "eod", "end of day", "friday", "monday", "next week", "deliver", "ship", "deploy", "fix", "resolve"]):
+        reasons.append(SupportReason(code="TIMELINE_GUARANTEE", severity="HARD", evidence=hits))
 
     if not reasons:
         reasons.append(SupportReason(code="COMMITMENT_DETECTED", severity="HARD", evidence=hits))
@@ -442,6 +436,94 @@ def _decision_from_commitment(commitment: Dict[str, Any]) -> str:
     if sev in ("NONE", "OK", "SAFE"):
         return "ALLOW"
     return "REQUIRE_APPROVAL"
+
+
+def _decision_explainer(decision: str, reasons: List[SupportReason]) -> str:
+    if decision == "ALLOW":
+        return "Allowed: no financial, billing, contractual, or guarantee language detected."
+    # concise, one-line
+    codes = [r.code for r in reasons] or ["COMMITMENT_DETECTED"]
+    # map to short human string
+    mapping = {
+        "FINANCIAL_COMMITMENT": "financial commitment",
+        "BILLING_CHANGE": "billing change",
+        "PRICING_CHANGE": "pricing change",
+        "CONTRACTUAL_COMMITMENT": "contractual commitment",
+        "TIMELINE_GUARANTEE": "timeline/guarantee",
+        "COMMITMENT_DETECTED": "commitment language",
+    }
+    human = ", ".join(mapping.get(c, c.lower()) for c in codes[:3])
+    return f"Blocked: {human}. Requires approval before sending."
+
+
+# ----------------------------
+# Approvals helpers
+# ----------------------------
+
+def create_support_approval(payload: Dict[str, Any], api_key_hash: Optional[str]) -> str:
+    approval_id = str(uuid.uuid4())
+    conn = _conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO approvals
+            (approval_id, status, created_at, payload_json, decision, api_key_hash)
+            VALUES (?, 'PENDING', ?, ?, NULL, ?)
+            """,
+            (
+                approval_id,
+                now_ts(),
+                json.dumps(payload, ensure_ascii=False),
+                api_key_hash,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    audit(
+        event="support_approval_created",
+        actor="support_system",
+        env=payload.get("env"),
+        details={
+            "approval_id": approval_id,
+            "ticket_id": payload.get("ticket_id"),
+            "channel": payload.get("channel"),
+        },
+    )
+    return approval_id
+
+
+def _get_approval_row(approval_id: str) -> Optional[sqlite3.Row]:
+    conn = _conn()
+    try:
+        return conn.execute(
+            "SELECT * FROM approvals WHERE approval_id=? LIMIT 1",
+            (approval_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def _find_latest_support_approval_by_ticket(ticket_id: str) -> Optional[sqlite3.Row]:
+    """
+    SQLite doesn't let us index into JSON without JSON1 extensions reliably.
+    So we do a small scan of recent approvals and match payload_json in Python.
+    This is fine for v0; later move approvals to Postgres and index (type, ticket_id).
+    """
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM approvals ORDER BY created_at DESC LIMIT 500"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for r in rows:
+        payload = _parse_json(r["payload_json"])
+        if payload.get("type") == "support_message" and payload.get("ticket_id") == ticket_id:
+            return r
+    return None
 
 
 # ----------------------------
@@ -617,7 +699,7 @@ async def v1_messages_send(
                 (
                     approval_id,
                     now_ts(),
-                    json.dumps({"type": "message_send", "message": payload.model_dump()}, ensure_ascii=False),
+                    json.dumps({"type": "message_send", "message": payload.model_dump(), "env": env}, ensure_ascii=False),
                     idempotency_key,
                     key_rec.get("key_hash"),
                 ),
@@ -676,13 +758,14 @@ def support_messages_decide(
         if cached is not None:
             return cached
 
-    # Detect -> Explain -> Decide
+    audit_id = f"aud_{uuid.uuid4()}"
+
     commitment = detect_commitment(req.draft.text)
     reasons_models = _reasons_from_commitment(commitment)
-    reasons_dicts = [r.model_dump() for r in reasons_models]
     decision = _decision_from_commitment(commitment)
+    explainer = _decision_explainer(decision, reasons_models)
 
-    # Create approval if needed (support approvals are system-originated)
+    # Invariant: approval_id exists iff decision requires approval
     approval_id: Optional[str] = None
     if decision == "REQUIRE_APPROVAL":
         approval_payload = {
@@ -692,19 +775,15 @@ def support_messages_decide(
             "channel": req.channel,
             "draft": req.draft.text,
             "commitment": commitment,
-            "reasons": reasons_dicts,
+            "reasons": [r.model_dump() for r in reasons_models],
+            "audit_id": audit_id,
+            "suggested_edit": SAFE_FALLBACK_SUPPORT_REPLY,
+            "decision_explainer": explainer,
         }
-        approval_id = create_support_approval(approval_payload)
+        approval_id = create_support_approval(approval_payload, api_key_hash=key_rec.get("key_hash"))
 
-    # Log to support audit (in-memory) + durable audit log
-    audit_id = _log_support_audit(
-        ticket_id=req.ticket_id,
-        channel=req.channel,
-        decision=decision,
-        approval_id=approval_id,
-        commitment=commitment,
-        reasons=reasons_dicts,
-    )
+    if decision == "ALLOW":
+        approval_id = None
 
     audit(
         event="support_decide",
@@ -716,7 +795,8 @@ def support_messages_decide(
             "decision": decision,
             "approval_id": approval_id,
             "commitment": commitment,
-            "reasons": reasons_dicts,
+            "reasons": [r.model_dump() for r in reasons_models],
+            "decision_explainer": explainer,
             "idempotency_key": idempotency_key,
             "audit_id": audit_id,
         },
@@ -724,6 +804,7 @@ def support_messages_decide(
 
     resp_model = SupportDecideResponse(
         decision=decision,
+        decision_explainer=explainer,
         approval_id=approval_id,
         reasons=reasons_models,
         suggested_edit=SuggestedEdit(text=SAFE_FALLBACK_SUPPORT_REPLY),
@@ -734,6 +815,71 @@ def support_messages_decide(
         idem_put(f"support_decide::{idempotency_key}", "/v1/support/messages/decide", resp_model.model_dump())
 
     return resp_model
+
+
+@app.get("/v1/support/approvals/{approval_id}", response_model=SupportApprovalStatusResponse)
+def get_support_approval_status(
+    approval_id: str,
+    request: Request,
+    key_rec: Dict[str, Any] = Depends(require_api_key),
+    x_env: Optional[str] = Header(default="dev", alias="X-Env"),
+):
+    # This endpoint is API-key authenticated (not admin).
+    # It is designed for integrations: decide -> pending -> approve -> poll status.
+    row = _get_approval_row(approval_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Approval not found.")
+
+    payload = _parse_json(row["payload_json"])
+    payload_type = payload.get("type")
+
+    if payload_type != "support_message":
+        raise HTTPException(status_code=400, detail="Approval is not a support_message type.")
+
+    # Optional: enforce env match if present
+    env = (x_env or "dev").strip().lower()
+    payload_env = (payload.get("env") or "").strip().lower()
+    if payload_env and payload_env != env:
+        raise HTTPException(status_code=403, detail=f"Forbidden: approval is for env '{payload_env}', not '{env}'.")
+
+    reasons_list = payload.get("reasons") or []
+    reasons_models: List[SupportReason] = []
+    if isinstance(reasons_list, list):
+        for r in reasons_list:
+            if isinstance(r, dict):
+                reasons_models.append(SupportReason(**r))
+
+    explainer = str(payload.get("decision_explainer") or _decision_explainer("REQUIRE_APPROVAL", reasons_models))
+    suggested = str(payload.get("suggested_edit") or SAFE_FALLBACK_SUPPORT_REPLY)
+
+    return SupportApprovalStatusResponse(
+        approval_id=approval_id,
+        status=str(row["status"]),
+        decision=row["decision"],
+        ticket_id=payload.get("ticket_id"),
+        channel=payload.get("channel"),
+        env=payload.get("env"),
+        reasons=reasons_models,
+        commitment=payload.get("commitment") or {},
+        decision_explainer=explainer,
+        suggested_edit=SuggestedEdit(text=suggested),
+    )
+
+
+@app.get("/v1/support/approvals/by_ticket/{ticket_id}", response_model=SupportApprovalStatusResponse)
+def get_support_approval_by_ticket(
+    ticket_id: str,
+    request: Request,
+    key_rec: Dict[str, Any] = Depends(require_api_key),
+    x_env: Optional[str] = Header(default="dev", alias="X-Env"),
+):
+    row = _find_latest_support_approval_by_ticket(ticket_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="No support approval found for this ticket.")
+
+    approval_id = str(row["approval_id"])
+    # Reuse the main status endpoint logic
+    return get_support_approval_status(approval_id=approval_id, request=request, key_rec=key_rec, x_env=x_env)
 
 
 @app.post("/admin/approvals/{approval_id}/approve", dependencies=[Depends(require_admin)])
@@ -752,7 +898,7 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
         if row["status"] != "PENDING":
             return {"ok": True, "status": row["status"], "note": "Already decided."}
 
-        payload = json.loads(row["payload_json"] or "{}")
+        payload = _parse_json(row["payload_json"])
         payload_type = payload.get("type")
 
         # Case A: message_send approval => execute send
@@ -809,7 +955,7 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
                 "provider_result": {"message": "Support decision approved (no external side effects)."},
             }
 
-        # Unknown payload type
+        # Unknown payload type => approve but do nothing
         conn.execute(
             "UPDATE approvals SET status='APPROVED', decided_at=?, decision='APPROVE' WHERE approval_id=?",
             (now_ts(), approval_id),
@@ -894,9 +1040,3 @@ def audit_recent(limit: int = 50):
         return {"items": out}
     finally:
         conn.close()
-
-
-@app.get("/admin/support/audit/recent", dependencies=[Depends(require_admin)])
-def support_audit_recent(limit: int = 20):
-    limit = max(1, min(limit, 200))
-    return list(reversed(SUPPORT_AUDIT_LOG[-limit:]))
