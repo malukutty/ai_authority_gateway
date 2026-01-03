@@ -360,7 +360,8 @@ COMMITMENT_PATTERNS = [
     r"\b(cancel|cancellation|renewal|renew|terminate|termination)\b",
 ]
 
-SAFE_FALLBACK_SUPPORT_REPLY = "Thanks for reaching out. I’m going to get this reviewed and follow up shortly."
+
+SAFE_FALLBACK_SUPPORT_REPLY = "Thanks for reaching out. I'm going to get this reviewed and follow up shortly."
 
 
 def detect_commitment(text: str) -> Dict[str, Any]:
