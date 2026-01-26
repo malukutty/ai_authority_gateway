@@ -13,6 +13,10 @@ Env vars:
   APPROVAL_MODE=auto_execute|require_human_approval|simulate   # optional (default: require_human_approval)
   DENY_PROD=true|false                     # optional (default: false)
   KILL_SWITCH=true|false                   # optional (default: false)
+
+New (Self-serve keys):
+  SELF_SERVE_KEY_TTL_DAYS=7                # optional (default: 7)
+  SELF_SERVE_MAX_PER_HOUR=5                # optional (default: 5)
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ from datetime import datetime, timezone
 # App
 # ----------------------------
 
-app = FastAPI(title="Authority AI Gateway", version="0.4-path-b")
+app = FastAPI(title="Authority AI Gateway", version="0.5-path-b")
 
 # ----------------------------
 # DB (SQLite)
@@ -71,6 +75,12 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_created ON api_keys(created_at)")
+
+        # v0.5 migration: expires_at for self-serve keys (and future key expiry)
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()]
+        if "expires_at" not in cols:
+            conn.execute("ALTER TABLE api_keys ADD COLUMN expires_at INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at)")
 
         conn.execute(
             """
@@ -141,6 +151,16 @@ def bool_env(name: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def int_env(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
 def get_setting(name: str, default: str) -> str:
     v = os.getenv(name)
     return v.strip() if v is not None else default
@@ -198,6 +218,24 @@ def _parse_json(s: Optional[str]) -> Dict[str, Any]:
 
 
 # ----------------------------
+# Self-serve issuance rate limit (in-memory)
+# ----------------------------
+
+SELF_SERVE_ISSUE_LOG: Dict[str, List[int]] = {}  # ip -> [ts...]
+
+
+def _rate_limit_self_serve(ip: str, max_per_hour: int) -> None:
+    now = now_ts()
+    window_start = now - 3600
+    arr = SELF_SERVE_ISSUE_LOG.get(ip, [])
+    arr = [t for t in arr if t >= window_start]
+    if len(arr) >= max_per_hour:
+        raise HTTPException(status_code=429, detail="Too many keys issued from this IP. Try later.")
+    arr.append(now)
+    SELF_SERVE_ISSUE_LOG[ip] = arr
+
+
+# ----------------------------
 # Auth
 # ----------------------------
 
@@ -233,6 +271,11 @@ def require_api_key(
     if not row or row["status"] != "ACTIVE":
         raise HTTPException(status_code=401, detail="Unauthorized: invalid API key.")
 
+    # Expiry check (v0.5)
+    expires_at = row["expires_at"]
+    if expires_at is not None and int(expires_at) <= now_ts():
+        raise HTTPException(status_code=401, detail="Unauthorized: API key expired.")
+
     env = (x_env or "dev").strip().lower()
     if not env_allowed(row["allowed_envs"], env):
         raise HTTPException(status_code=403, detail=f"Forbidden: key not allowed for env '{env}'.")
@@ -255,6 +298,21 @@ class IssueKeyRequest(BaseModel):
 
 class RevokeKeyRequest(BaseModel):
     key_hash: str
+
+
+class SelfServeKeyRequest(BaseModel):
+    email: Optional[str] = Field(default=None, max_length=256)
+    company: Optional[str] = Field(default=None, max_length=256)
+    source: Optional[str] = Field(default="console", max_length=64)
+
+
+class SelfServeKeyResponse(BaseModel):
+    api_key: str
+    key_prefix: str
+    allowed_envs: str
+    requests_per_day: int
+    recipients_per_day: int
+    expires_at: int
 
 
 class MessageSendRequest(BaseModel):
@@ -313,17 +371,19 @@ class SupportApprovalStatusResponse(BaseModel):
 # Policy: commitment detection + kill switches
 # ----------------------------
 
-# v0.4 improvement:
-# - keep regex patterns for detection
-# - but return evidence as human keywords/snippets, not raw regex strings
-
 # (reason_code, regex)
 COMMITMENT_RULES: List[Tuple[str, str]] = [
     ("FINANCIAL_COMMITMENT", r"\b(refund|refunds|credit|credited|free of charge|waive|waived)\b"),
     ("BILLING_CHANGE", r"\b(invoice|payment|paid|charge|charged|billing|bill|prorate)\b"),
     ("PRICING_CHANGE", r"\b(discount|discounted|price cut|reduce the price|we will lower)\b"),
-    ("CONTRACTUAL_COMMITMENT", r"\b(contract|msa|dpa|sow|purchase order|po|renewal|renew|terminate|termination|cancel|cancellation)\b"),
-    ("TIMELINE_GUARANTEE", r"\b(guarantee|guaranteed|we promise|we commit)\b|\bby (?:tomorrow|eod|end of day|friday|monday|next week)\b|\bwe will (?:deliver|ship|deploy|fix|resolve)\b"),
+    (
+        "CONTRACTUAL_COMMITMENT",
+        r"\b(contract|msa|dpa|sow|purchase order|po|renewal|renew|terminate|termination|cancel|cancellation)\b",
+    ),
+    (
+        "TIMELINE_GUARANTEE",
+        r"\b(guarantee|guaranteed|we promise|we commit)\b|\bby (?:tomorrow|eod|end of day|friday|monday|next week)\b|\bwe will (?:deliver|ship|deploy|fix|resolve)\b",
+    ),
 ]
 
 SAFE_FALLBACK_SUPPORT_REPLY = "Thanks for reaching out. I'm going to get this reviewed and follow up shortly."
@@ -339,11 +399,10 @@ def _extract_evidence(text: str, max_items: int = 8) -> List[str]:
     """
     if not text:
         return []
-    t = text
     hits: List[str] = []
     seen = set()
     for _, pattern in COMMITMENT_RULES:
-        for m in re.finditer(pattern, t, flags=re.IGNORECASE):
+        for m in re.finditer(pattern, text, flags=re.IGNORECASE):
             s = (m.group(0) or "").strip()
             if not s:
                 continue
@@ -441,9 +500,7 @@ def _decision_from_commitment(commitment: Dict[str, Any]) -> str:
 def _decision_explainer(decision: str, reasons: List[SupportReason]) -> str:
     if decision == "ALLOW":
         return "Allowed: no financial, billing, contractual, or guarantee language detected."
-    # concise, one-line
     codes = [r.code for r in reasons] or ["COMMITMENT_DETECTED"]
-    # map to short human string
     mapping = {
         "FINANCIAL_COMMITMENT": "financial commitment",
         "BILLING_CHANGE": "billing change",
@@ -506,11 +563,6 @@ def _get_approval_row(approval_id: str) -> Optional[sqlite3.Row]:
 
 
 def _find_latest_support_approval_by_ticket(ticket_id: str) -> Optional[sqlite3.Row]:
-    """
-    SQLite doesn't let us index into JSON without JSON1 extensions reliably.
-    So we do a small scan of recent approvals and match payload_json in Python.
-    This is fine for v0; later move approvals to Postgres and index (type, ticket_id).
-    """
     conn = _conn()
     try:
         rows = conn.execute(
@@ -578,6 +630,82 @@ def health():
         "deny_prod": bool_env("DENY_PROD", False),
         "approval_mode": get_setting("APPROVAL_MODE", "require_human_approval"),
     }
+
+
+@app.post("/v1/keys/self_serve", response_model=SelfServeKeyResponse)
+def self_serve_issue_key(req: SelfServeKeyRequest, request: Request):
+    client_ip = (request.client.host if request.client else "unknown").strip()
+
+    max_per_hour = int_env("SELF_SERVE_MAX_PER_HOUR", 5)
+    _rate_limit_self_serve(client_ip, max_per_hour=max_per_hour)
+
+    ttl_days = int_env("SELF_SERVE_KEY_TTL_DAYS", 7)
+
+    # Hard constraints (Option A)
+    key_prefix = "aia_dev"
+    allowed_envs = "dev"
+    requests_per_day = 200
+    recipients_per_day = 0
+    expires_at = now_ts() + (ttl_days * 24 * 3600)
+
+    token = secrets.token_hex(24)
+    raw_key = f"{key_prefix}_{token}"
+    key_hash = sha256_hex(raw_key)
+
+    notes_obj = {
+        "self_serve": True,
+        "email": req.email,
+        "company": req.company,
+        "source": req.source,
+        "ip": client_ip,
+    }
+
+    conn = _conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO api_keys
+            (key_hash, key_prefix, status, allowed_envs, requests_per_day, recipients_per_day, created_at, expires_at, notes)
+            VALUES (?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key_hash,
+                key_prefix,
+                allowed_envs,
+                requests_per_day,
+                recipients_per_day,
+                now_ts(),
+                expires_at,
+                json.dumps(notes_obj, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    audit(
+        event="key_issued_self_serve",
+        actor="self_serve",
+        env="dev",
+        details={
+            "key_hash_prefix": key_hash[:12],
+            "expires_at": expires_at,
+            "email": req.email,
+            "company": req.company,
+            "source": req.source,
+            "ip": client_ip,
+        },
+    )
+
+    # Returned once. UI must show once and store client-side.
+    return SelfServeKeyResponse(
+        api_key=raw_key,
+        key_prefix=key_prefix,
+        allowed_envs=allowed_envs,
+        requests_per_day=requests_per_day,
+        recipients_per_day=recipients_per_day,
+        expires_at=expires_at,
+    )
 
 
 @app.post("/internal/keys/issue", dependencies=[Depends(require_admin)])
@@ -765,7 +893,6 @@ def support_messages_decide(
     decision = _decision_from_commitment(commitment)
     explainer = _decision_explainer(decision, reasons_models)
 
-    # Invariant: approval_id exists iff decision requires approval
     approval_id: Optional[str] = None
     if decision == "REQUIRE_APPROVAL":
         approval_payload = {
@@ -824,8 +951,6 @@ def get_support_approval_status(
     key_rec: Dict[str, Any] = Depends(require_api_key),
     x_env: Optional[str] = Header(default="dev", alias="X-Env"),
 ):
-    # This endpoint is API-key authenticated (not admin).
-    # It is designed for integrations: decide -> pending -> approve -> poll status.
     row = _get_approval_row(approval_id)
     if not row:
         raise HTTPException(status_code=404, detail="Approval not found.")
@@ -836,7 +961,6 @@ def get_support_approval_status(
     if payload_type != "support_message":
         raise HTTPException(status_code=400, detail="Approval is not a support_message type.")
 
-    # Optional: enforce env match if present
     env = (x_env or "dev").strip().lower()
     payload_env = (payload.get("env") or "").strip().lower()
     if payload_env and payload_env != env:
@@ -878,7 +1002,6 @@ def get_support_approval_by_ticket(
         raise HTTPException(status_code=404, detail="No support approval found for this ticket.")
 
     approval_id = str(row["approval_id"])
-    # Reuse the main status endpoint logic
     return get_support_approval_status(approval_id=approval_id, request=request, key_rec=key_rec, x_env=x_env)
 
 
@@ -901,7 +1024,6 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
         payload = _parse_json(row["payload_json"])
         payload_type = payload.get("type")
 
-        # Case A: message_send approval => execute send
         if payload_type == "message_send":
             msg_obj = payload.get("message") or {}
             msg = MessageSendRequest(**msg_obj)
@@ -930,7 +1052,6 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
                 "provider_result": result,
             }
 
-        # Case B: support_message approval => mark approved only (decision gate)
         if payload_type == "support_message":
             conn.execute(
                 "UPDATE approvals SET status='APPROVED', decided_at=?, decision='APPROVE' WHERE approval_id=?",
@@ -955,7 +1076,6 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
                 "provider_result": {"message": "Support decision approved (no external side effects)."},
             }
 
-        # Unknown payload type => approve but do nothing
         conn.execute(
             "UPDATE approvals SET status='APPROVED', decided_at=?, decision='APPROVE' WHERE approval_id=?",
             (now_ts(), approval_id),
