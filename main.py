@@ -34,13 +34,12 @@ from typing import Any, Dict, Optional, List, Tuple
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
-from datetime import datetime, timezone
 
 # ----------------------------
 # App
 # ----------------------------
 
-app = FastAPI(title="Authority AI Gateway", version="0.5-path-b")
+app = FastAPI(title="Authority AI Gateway", version="0.6-path-b")
 
 # ----------------------------
 # DB (SQLite)
@@ -371,9 +370,9 @@ class SupportApprovalStatusResponse(BaseModel):
 # Policy: commitment detection + kill switches
 # ----------------------------
 
-# (reason_code, regex)
+# Keep your regex rules (fast, precise). We layer typo-tolerant matching on top.
 COMMITMENT_RULES: List[Tuple[str, str]] = [
-    ("FINANCIAL_COMMITMENT", r"\b(refund|refunds|credit|credited|free of charge|waive|waived)\b"),
+    ("FINANCIAL_COMMITMENT", r"\b(refund|refunds|credit|credited|free of charge|waive|waived|reimburse|reimbursed)\b"),
     ("BILLING_CHANGE", r"\b(invoice|payment|paid|charge|charged|billing|bill|prorate)\b"),
     ("PRICING_CHANGE", r"\b(discount|discounted|price cut|reduce the price|we will lower)\b"),
     (
@@ -382,21 +381,101 @@ COMMITMENT_RULES: List[Tuple[str, str]] = [
     ),
     (
         "TIMELINE_GUARANTEE",
-        r"\b(guarantee|guaranteed|we promise|we commit)\b|\bby (?:tomorrow|eod|end of day|friday|monday|next week)\b|\bwe will (?:deliver|ship|deploy|fix|resolve)\b",
+        r"\b(guarantee|guaranteed|we promise|we commit|promise|commit)\b|\bby (?:tomorrow|eod|end of day|friday|monday|next week)\b|\bwe will (?:deliver|ship|deploy|fix|resolve)\b",
     ),
 ]
 
 SAFE_FALLBACK_SUPPORT_REPLY = "Thanks for reaching out. I'm going to get this reviewed and follow up shortly."
 
 
-def _extract_evidence(text: str, max_items: int = 8) -> List[str]:
-    """
-    Return short human evidence strings like:
-      - "refund"
-      - "waive"
-      - "invoice"
-    (Not regex patterns.)
-    """
+# --- v0.6: typo-tolerant deterministic detection (no external deps) ---
+
+KEYWORDS_BY_CODE: Dict[str, List[str]] = {
+    "FINANCIAL_COMMITMENT": ["refund", "refunds", "credit", "credited", "waive", "waived", "reimburse", "reimbursed"],
+    "BILLING_CHANGE": ["invoice", "billing", "bill", "charge", "charged", "payment", "paid", "prorate"],
+    "PRICING_CHANGE": ["discount", "discounted", "price", "pricing", "lower", "reduce"],
+    "CONTRACTUAL_COMMITMENT": [
+        "contract",
+        "msa",
+        "dpa",
+        "sow",
+        "purchaseorder",
+        "po",
+        "renewal",
+        "renew",
+        "terminate",
+        "termination",
+        "cancel",
+        "cancellation",
+    ],
+    "TIMELINE_GUARANTEE": ["guarantee", "guaranteed", "promise", "commit", "committed", "deliver", "ship", "deploy", "fix", "resolve"],
+}
+
+COMMITMENT_VERBS = ["we will", "we'll", "i will", "i'll", "going to", "we are going to", "promise", "guarantee", "commit"]
+
+
+def _norm_basic(s: str) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _squash_repeats(token: str) -> str:
+    if not token:
+        return token
+    out = [token[0]]
+    for ch in token[1:]:
+        if ch != out[-1]:
+            out.append(ch)
+    return "".join(out)
+
+
+def _tokenize_for_fuzzy(s: str) -> List[str]:
+    s = _norm_basic(s)
+    tokens = [t for t in s.split(" ") if t]
+    return [_squash_repeats(t) for t in tokens]
+
+
+def _levenshtein(a: str, b: str, max_dist: int) -> int:
+    if a == b:
+        return 0
+    if not a or not b:
+        return max(len(a), len(b))
+    if abs(len(a) - len(b)) > max_dist:
+        return max_dist + 1
+
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        row_min = cur[0]
+        for j, cb in enumerate(b, start=1):
+            ins = cur[j - 1] + 1
+            dele = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            v = ins if ins < dele else dele
+            v = v if v < sub else sub
+            cur.append(v)
+            if v < row_min:
+                row_min = v
+        if row_min > max_dist:
+            return max_dist + 1
+        prev = cur
+    return prev[-1]
+
+
+def _max_edit_distance_for(keyword: str) -> int:
+    n = len(keyword)
+    if n <= 5:
+        return 1
+    if n <= 8:
+        return 2
+    return 2
+
+
+def _extract_evidence_regex(text: str, max_items: int = 8) -> List[str]:
     if not text:
         return []
     hits: List[str] = []
@@ -416,10 +495,68 @@ def _extract_evidence(text: str, max_items: int = 8) -> List[str]:
     return hits
 
 
+def _collect_fuzzy_hits(text: str, max_items: int = 10) -> List[Dict[str, Any]]:
+    tokens = _tokenize_for_fuzzy(text)
+
+    # Stitch bigrams/trigrams to catch "refun d", "invo ice"
+    stitched: List[str] = []
+    for i in range(len(tokens) - 1):
+        stitched.append(tokens[i] + tokens[i + 1])
+    for i in range(len(tokens) - 2):
+        stitched.append(tokens[i] + tokens[i + 1] + tokens[i + 2])
+
+    candidates = tokens + stitched
+
+    hits: List[Dict[str, Any]] = []
+    seen = set()
+
+    for code, words in KEYWORDS_BY_CODE.items():
+        for kw in words:
+            kw_norm = kw.replace(" ", "")
+            maxd = _max_edit_distance_for(kw_norm)
+            for cand in candidates:
+                if not cand:
+                    continue
+                if abs(len(cand) - len(kw_norm)) > maxd:
+                    continue
+                d = _levenshtein(cand, kw_norm, maxd)
+                if d <= maxd:
+                    key = (code, cand, kw_norm, d)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    hits.append({"code": code, "evidence": f"{cand} ~ {kw_norm} (dist={d})"})
+                    if len(hits) >= max_items:
+                        return hits
+    return hits
+
+
 def detect_commitment(text: str) -> Dict[str, Any]:
-    evidence = _extract_evidence(text)
-    severity = "HARD_COMMITMENT" if evidence else "NONE"
-    return {"severity": severity, "hits": evidence}
+    """
+    v0.6 detection:
+      1) regex exact matches (fast, precise)
+      2) typo-tolerant fuzzy matches (deterministic)
+    Returns:
+      {"severity": "...", "hits": [...], "codes": [...]}
+    """
+    regex_hits = _extract_evidence_regex(text, max_items=8)
+    fuzzy_hits = _collect_fuzzy_hits(text, max_items=10)
+
+    codes = sorted({h["code"] for h in fuzzy_hits})
+    evidence = list(regex_hits)  # exact snippets first
+
+    # add fuzzy evidence, but avoid duplicates by rough token compare
+    seen = {e.lower() for e in evidence}
+    for h in fuzzy_hits:
+        ev = h["evidence"]
+        ev_norm = ev.lower()
+        if ev_norm in seen:
+            continue
+        seen.add(ev_norm)
+        evidence.append(ev)
+
+    severity = "HARD_COMMITMENT" if (regex_hits or fuzzy_hits) else "NONE"
+    return {"severity": severity, "hits": evidence, "codes": codes}
 
 
 def get_approval_mode(env: str, commitment_sev: str) -> str:
@@ -458,9 +595,17 @@ def _normalize_hits(hits: Any) -> List[str]:
 def _reasons_from_commitment(commitment: Dict[str, Any]) -> List[SupportReason]:
     severity = str(commitment.get("severity") or "NONE").upper()
     hits = _normalize_hits(commitment.get("hits"))
+    codes = commitment.get("codes") or []
 
     if severity in ("NONE", "OK", "SAFE"):
         return []
+
+    # If detect_commitment already produced codes, trust them.
+    if isinstance(codes, list) and codes:
+        out: List[SupportReason] = []
+        for c in codes:
+            out.append(SupportReason(code=str(c), severity="HARD", evidence=hits))
+        return out
 
     joined = " ".join(hits).lower()
 
@@ -469,13 +614,13 @@ def _reasons_from_commitment(commitment: Dict[str, Any]) -> List[SupportReason]:
 
     reasons: List[SupportReason] = []
 
-    if has_any(["refund", "refunds", "credit", "credited", "waive", "free of charge"]):
+    if has_any(["refund", "refunds", "credit", "credited", "waive", "waived", "free of charge", "reimburse", "reimbursed"]):
         reasons.append(SupportReason(code="FINANCIAL_COMMITMENT", severity="HARD", evidence=hits))
 
     if has_any(["invoice", "billing", "bill", "charge", "charged", "payment", "paid", "prorate"]):
         reasons.append(SupportReason(code="BILLING_CHANGE", severity="HARD", evidence=hits))
 
-    if has_any(["discount", "discounted", "price cut", "reduce the price", "lower"]):
+    if has_any(["discount", "discounted", "price cut", "reduce the price", "lower", "pricing"]):
         reasons.append(SupportReason(code="PRICING_CHANGE", severity="HARD", evidence=hits))
 
     if has_any(["cancel", "cancellation", "renew", "renewal", "terminate", "termination", "contract", "msa", "dpa", "sow", "po"]):
@@ -565,9 +710,7 @@ def _get_approval_row(approval_id: str) -> Optional[sqlite3.Row]:
 def _find_latest_support_approval_by_ticket(ticket_id: str) -> Optional[sqlite3.Row]:
     conn = _conn()
     try:
-        rows = conn.execute(
-            "SELECT * FROM approvals ORDER BY created_at DESC LIMIT 500"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM approvals ORDER BY created_at DESC LIMIT 500").fetchall()
     finally:
         conn.close()
 
@@ -697,7 +840,6 @@ def self_serve_issue_key(req: SelfServeKeyRequest, request: Request):
         },
     )
 
-    # Returned once. UI must show once and store client-side.
     return SelfServeKeyResponse(
         api_key=raw_key,
         key_prefix=key_prefix,
