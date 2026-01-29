@@ -1,0 +1,13 @@
+name: Keep Railway Awake
+
+on:
+  schedule:
+    - cron: "*/3 * * * *"
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          curl -fsS https://aiauthoritygateway-production.up.railway.app/health || true
