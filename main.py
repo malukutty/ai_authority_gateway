@@ -687,7 +687,7 @@ def _decision_explainer(decision: str, reasons: List[SupportReason]) -> str:
 
 
 # ----------------------------
-# v3 helpers: redaction + spans (FIXED: no name collisions with v1 helpers)
+# v3 helpers: redaction + spans (FIXED)
 # ----------------------------
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
@@ -712,9 +712,10 @@ def redact_text(s: str, max_len: int = 4000) -> str:
     return out
 
 
+# FIX 1: b1ll -> bill (1 maps to "l", not "i")
 _V3_LEET_MAP = str.maketrans({
     "0": "o",
-    "1": "i",
+    "1": "l",
     "2": "z",
     "3": "e",
     "4": "a",
@@ -837,17 +838,57 @@ def _v3_fuzzy_spans(redacted: str) -> List[TriggeredSpan]:
     return spans
 
 
+# FIX 2: collapse overlapping spammy spans deterministically
+def _v3_collapse_spans(spans: List[TriggeredSpan], max_per_label: int = 2) -> List[TriggeredSpan]:
+    if not spans:
+        return []
+
+    spans = sorted(spans, key=lambda s: (s.label, s.start, (s.end - s.start), s.end))
+    out: List[TriggeredSpan] = []
+    per_label: Dict[str, int] = {}
+
+    def overlaps(a: TriggeredSpan, b: TriggeredSpan) -> bool:
+        return not (a.end <= b.start or b.end <= a.start)
+
+    for s in spans:
+        cnt = per_label.get(s.label, 0)
+        if cnt >= max_per_label:
+            continue
+
+        replaced = False
+        for i, existing in enumerate(out):
+            if existing.label != s.label:
+                continue
+            if overlaps(existing, s):
+                ex_len = existing.end - existing.start
+                s_len = s.end - s.start
+                if (s_len < ex_len) or (s_len == ex_len and s.start < existing.start):
+                    out[i] = s
+                replaced = True
+                break
+
+        if replaced:
+            continue
+
+        out.append(s)
+        per_label[s.label] = cnt + 1
+
+    out.sort(key=lambda s: (s.start, s.end, s.label))
+    return out
+
+
 def v3_detect_with_spans(text: str) -> Dict[str, Any]:
     redacted = redact_text(text)
 
-    spans = _v3_regex_spans(redacted)
-    spans += _v3_fuzzy_spans(redacted)
+    regex_spans = _v3_regex_spans(redacted)
+    fuzzy_spans = _v3_fuzzy_spans(redacted)
 
-    uniq: Dict[tuple, TriggeredSpan] = {}
-    for s in spans:
-        uniq[(s.label, s.start, s.end)] = s
-    spans = list(uniq.values())
-    spans.sort(key=lambda x: (x.start, x.end))
+    # FIX 3: if regex already caught a label, don't let fuzzy spam that same label
+    regex_labels = {s.label for s in regex_spans}
+    fuzzy_spans = [s for s in fuzzy_spans if s.label not in regex_labels]
+
+    spans = regex_spans + fuzzy_spans
+    spans = _v3_collapse_spans(spans, max_per_label=2)
 
     commitment_types = sorted({s.label for s in spans})
     severity = "HARD_COMMITMENT" if spans else "NONE"
@@ -1000,7 +1041,10 @@ def v3_support_decide(req: V3SupportDecideRequest, request: Request):
             ApprovalChainStep(role="manager", eta_minutes=15),
         ]
 
-    reasons_models = [SupportReason(code=c, severity="HARD", evidence=[s.snippet for s in det["triggered_spans"]]) for c in commitment_types]
+    reasons_models = [
+        SupportReason(code=c, severity="HARD", evidence=[s.snippet for s in det["triggered_spans"]])
+        for c in commitment_types
+    ]
     explainer = _decision_explainer(decision, reasons_models)
 
     approval_id: Optional[str] = None
