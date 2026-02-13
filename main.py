@@ -21,6 +21,7 @@ New (Self-serve keys):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import re
 import json
@@ -75,7 +76,6 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_created ON api_keys(created_at)")
 
-        # v0.5 migration: expires_at for self-serve keys (and future key expiry)
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()]
         if "expires_at" not in cols:
             conn.execute("ALTER TABLE api_keys ADD COLUMN expires_at INTEGER")
@@ -220,7 +220,7 @@ def _parse_json(s: Optional[str]) -> Dict[str, Any]:
 # Self-serve issuance rate limit (in-memory)
 # ----------------------------
 
-SELF_SERVE_ISSUE_LOG: Dict[str, List[int]] = {}  # ip -> [ts...]
+SELF_SERVE_ISSUE_LOG: Dict[str, List[int]] = {}
 
 
 def _rate_limit_self_serve(ip: str, max_per_hour: int) -> None:
@@ -270,7 +270,6 @@ def require_api_key(
     if not row or row["status"] != "ACTIVE":
         raise HTTPException(status_code=401, detail="Unauthorized: invalid API key.")
 
-    # Expiry check (v0.5)
     expires_at = row["expires_at"]
     if expires_at is not None and int(expires_at) <= now_ts():
         raise HTTPException(status_code=401, detail="Unauthorized: API key expired.")
@@ -366,11 +365,68 @@ class SupportApprovalStatusResponse(BaseModel):
     suggested_edit: SuggestedEdit
 
 
+# ---- v3 response models (redacted text + triggered spans only)
+
+class TriggeredSpan(BaseModel):
+    start: int
+    end: int
+    label: str
+    snippet: str
+
+
+class ApprovalChainStep(BaseModel):
+    role: str
+    eta_minutes: int
+
+
+class V3SupportDecideRequest(BaseModel):
+    env: str = Field(default="dev", max_length=8)
+    channel: str = Field(..., min_length=1, max_length=64)
+    actor_type: str = Field(..., min_length=1, max_length=32)
+    ticket_id: str = Field(..., min_length=1, max_length=128)
+    draft: SupportDraft
+
+
+class V3SupportDecideResponse(BaseModel):
+    decision: str
+    decision_explainer: str
+    risk_score: int
+    commitment_types: List[str] = []
+    redacted_text: str
+    triggered_spans: List[TriggeredSpan] = []
+    policy_path: List[str] = []
+    approval_chain_preview: List[ApprovalChainStep] = []
+    approval_id: Optional[str] = None
+    audit_id: str
+
+
+class V3BillingRefundDecideRequest(BaseModel):
+    env: str = Field(default="dev", max_length=8)
+    actor_type: str = Field(..., min_length=1, max_length=32)
+    ticket_id: str = Field(..., min_length=1, max_length=128)
+    charge_id: Optional[str] = Field(default=None, max_length=128)
+    customer_id: Optional[str] = Field(default=None, max_length=128)
+    amount_cents: int = Field(..., ge=0, le=50_000_000)
+    currency: str = Field(default="usd", max_length=8)
+    note: Optional[str] = Field(default="", max_length=50_000)
+
+
+class V3BillingRefundDecideResponse(BaseModel):
+    decision: str
+    decision_explainer: str
+    risk_score: int
+    redacted_text: str
+    triggered_spans: List[TriggeredSpan] = []
+    policy_path: List[str] = []
+    approval_chain_preview: List[ApprovalChainStep] = []
+    approval_id: Optional[str] = None
+    audit_id: str
+
+
 # ----------------------------
 # Policy: commitment detection + kill switches
 # ----------------------------
 
-# Keep your regex rules (fast, precise). We layer typo-tolerant matching on top.
 COMMITMENT_RULES: List[Tuple[str, str]] = [
     ("FINANCIAL_COMMITMENT", r"\b(refund|refunds|credit|credited|free of charge|waive|waived|reimburse|reimbursed)\b"),
     ("BILLING_CHANGE", r"\b(invoice|payment|paid|charge|charged|billing|bill|prorate)\b"),
@@ -381,37 +437,24 @@ COMMITMENT_RULES: List[Tuple[str, str]] = [
     ),
     (
         "TIMELINE_GUARANTEE",
-        r"\b(guarantee|guaranteed|we promise|we commit|promise|commit)\b|\bby (?:tomorrow|eod|end of day|friday|monday|next week)\b|\bwe will (?:deliver|ship|deploy|fix|resolve)\b",
+        r"\b(guarantee|guaranteed|we promise|we commit|promise|commit)\b"
+        r"|\bby (?:tomorrow|eod|end of day|friday|monday|next week)\b"
+        r"|\bwe will (?:deliver|ship|deploy|fix|resolve)\b",
     ),
 ]
 
 SAFE_FALLBACK_SUPPORT_REPLY = "Thanks for reaching out. I'm going to get this reviewed and follow up shortly."
-
-
-# --- v0.6: typo-tolerant deterministic detection (no external deps) ---
 
 KEYWORDS_BY_CODE: Dict[str, List[str]] = {
     "FINANCIAL_COMMITMENT": ["refund", "refunds", "credit", "credited", "waive", "waived", "reimburse", "reimbursed"],
     "BILLING_CHANGE": ["invoice", "billing", "bill", "charge", "charged", "payment", "paid", "prorate"],
     "PRICING_CHANGE": ["discount", "discounted", "price", "pricing", "lower", "reduce"],
     "CONTRACTUAL_COMMITMENT": [
-        "contract",
-        "msa",
-        "dpa",
-        "sow",
-        "purchaseorder",
-        "po",
-        "renewal",
-        "renew",
-        "terminate",
-        "termination",
-        "cancel",
-        "cancellation",
+        "contract", "msa", "dpa", "sow", "purchaseorder", "po",
+        "renewal", "renew", "terminate", "termination", "cancel", "cancellation",
     ],
     "TIMELINE_GUARANTEE": ["guarantee", "guaranteed", "promise", "commit", "committed", "deliver", "ship", "deploy", "fix", "resolve"],
 }
-
-COMMITMENT_VERBS = ["we will", "we'll", "i will", "i'll", "going to", "we are going to", "promise", "guarantee", "commit"]
 
 
 def _norm_basic(s: str) -> str:
@@ -498,7 +541,6 @@ def _extract_evidence_regex(text: str, max_items: int = 8) -> List[str]:
 def _collect_fuzzy_hits(text: str, max_items: int = 10) -> List[Dict[str, Any]]:
     tokens = _tokenize_for_fuzzy(text)
 
-    # Stitch bigrams/trigrams to catch "refun d", "invo ice"
     stitched: List[str] = []
     for i in range(len(tokens) - 1):
         stitched.append(tokens[i] + tokens[i + 1])
@@ -532,20 +574,12 @@ def _collect_fuzzy_hits(text: str, max_items: int = 10) -> List[Dict[str, Any]]:
 
 
 def detect_commitment(text: str) -> Dict[str, Any]:
-    """
-    v0.6 detection:
-      1) regex exact matches (fast, precise)
-      2) typo-tolerant fuzzy matches (deterministic)
-    Returns:
-      {"severity": "...", "hits": [...], "codes": [...]}
-    """
     regex_hits = _extract_evidence_regex(text, max_items=8)
     fuzzy_hits = _collect_fuzzy_hits(text, max_items=10)
 
     codes = sorted({h["code"] for h in fuzzy_hits})
-    evidence = list(regex_hits)  # exact snippets first
+    evidence = list(regex_hits)
 
-    # add fuzzy evidence, but avoid duplicates by rough token compare
     seen = {e.lower() for e in evidence}
     for h in fuzzy_hits:
         ev = h["evidence"]
@@ -600,12 +634,8 @@ def _reasons_from_commitment(commitment: Dict[str, Any]) -> List[SupportReason]:
     if severity in ("NONE", "OK", "SAFE"):
         return []
 
-    # If detect_commitment already produced codes, trust them.
     if isinstance(codes, list) and codes:
-        out: List[SupportReason] = []
-        for c in codes:
-            out.append(SupportReason(code=str(c), severity="HARD", evidence=hits))
-        return out
+        return [SupportReason(code=str(c), severity="HARD", evidence=hits) for c in codes]
 
     joined = " ".join(hits).lower()
 
@@ -637,9 +667,7 @@ def _reasons_from_commitment(commitment: Dict[str, Any]) -> List[SupportReason]:
 
 def _decision_from_commitment(commitment: Dict[str, Any]) -> str:
     sev = str(commitment.get("severity") or "NONE").upper()
-    if sev in ("NONE", "OK", "SAFE"):
-        return "ALLOW"
-    return "REQUIRE_APPROVAL"
+    return "ALLOW" if sev in ("NONE", "OK", "SAFE") else "REQUIRE_APPROVAL"
 
 
 def _decision_explainer(decision: str, reasons: List[SupportReason]) -> str:
@@ -656,6 +684,193 @@ def _decision_explainer(decision: str, reasons: List[SupportReason]) -> str:
     }
     human = ", ".join(mapping.get(c, c.lower()) for c in codes[:3])
     return f"Blocked: {human}. Requires approval before sending."
+
+
+# ----------------------------
+# v3 helpers: redaction + spans (FIXED: no name collisions with v1 helpers)
+# ----------------------------
+
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+URL_RE = re.compile(r"\bhttps?://[^\s]+\b", re.IGNORECASE)
+PHONE_RE = re.compile(r"\b(?:\+?1[\s\-\.]?)?(?:\(\d{3}\)|\d{3})[\s\-\.]?\d{3}[\s\-\.]?\d{4}\b")
+CURRENCY_RE = re.compile(r"(\$|usd|eur|gbp)\s*\d+(?:[.,]\d+)?|\b\d+(?:[.,]\d+)?\s*(usd|eur|gbp)\b", re.IGNORECASE)
+NUMBER_RE = re.compile(r"\b\d+\b")
+
+
+def redact_text(s: str, max_len: int = 4000) -> str:
+    if not s:
+        return ""
+    out = s
+    out = EMAIL_RE.sub("[EMAIL]", out)
+    out = URL_RE.sub("[URL]", out)
+    out = PHONE_RE.sub("[PHONE]", out)
+    out = CURRENCY_RE.sub("[AMOUNT]", out)
+    out = NUMBER_RE.sub("[AMOUNT]", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    if len(out) > max_len:
+        out = out[:max_len].rstrip()
+    return out
+
+
+_V3_LEET_MAP = str.maketrans({
+    "0": "o",
+    "1": "i",
+    "2": "z",
+    "3": "e",
+    "4": "a",
+    "5": "s",
+    "6": "g",
+    "7": "t",
+    "8": "b",
+    "9": "g",
+})
+
+
+def _v3_squash_repeats(token: str) -> str:
+    if not token:
+        return token
+    out = [token[0]]
+    for ch in token[1:]:
+        if ch != out[-1]:
+            out.append(ch)
+    return "".join(out)
+
+
+def _v3_norm_token(token: str) -> str:
+    t = (token or "").lower().translate(_V3_LEET_MAP)
+    t = re.sub(r"[^a-z0-9]", "", t)
+    t = _v3_squash_repeats(t)
+    return t
+
+
+def _v3_max_edit_distance_for(keyword: str) -> int:
+    n = len(keyword)
+    if n <= 4:
+        return 1
+    if n <= 7:
+        return 2
+    return 2
+
+
+@dataclass
+class _V3TokSpan:
+    raw: str
+    norm: str
+    start: int
+    end: int
+
+
+def _v3_token_spans(s: str) -> List[_V3TokSpan]:
+    spans: List[_V3TokSpan] = []
+    for m in re.finditer(r"\b[a-zA-Z0-9]+\b", s):
+        raw = m.group(0)
+        norm = _v3_norm_token(raw)
+        spans.append(_V3TokSpan(raw=raw, norm=norm, start=m.start(), end=m.end()))
+    return spans
+
+
+def _v3_snippet(s: str, start: int, end: int, max_len: int = 120) -> str:
+    if start < 0:
+        start = 0
+    if end > len(s):
+        end = len(s)
+    mid = (start + end) // 2
+    half = max_len // 2
+    a = max(0, mid - half)
+    b = min(len(s), a + max_len)
+    a = max(0, b - max_len)
+    return s[a:b]
+
+
+def _v3_regex_spans(redacted: str) -> List[TriggeredSpan]:
+    spans: List[TriggeredSpan] = []
+    seen = set()
+    for code, pattern in COMMITMENT_RULES:
+        for m in re.finditer(pattern, redacted, flags=re.IGNORECASE):
+            st, en = m.start(), m.end()
+            key = (code, st, en)
+            if key in seen:
+                continue
+            seen.add(key)
+            spans.append(TriggeredSpan(start=st, end=en, label=code, snippet=_v3_snippet(redacted, st, en)))
+    return spans
+
+
+def _v3_fuzzy_spans(redacted: str) -> List[TriggeredSpan]:
+    spans: List[TriggeredSpan] = []
+    seen = set()
+
+    toks = _v3_token_spans(redacted)
+    if not toks:
+        return spans
+
+    grams: List[tuple[str, int, int]] = []
+    for i, t in enumerate(toks):
+        grams.append((t.norm, t.start, t.end))
+        if i + 1 < len(toks):
+            t2 = toks[i + 1]
+            grams.append((t.norm + t2.norm, t.start, t2.end))
+        if i + 2 < len(toks):
+            t2 = toks[i + 1]
+            t3 = toks[i + 2]
+            grams.append((t.norm + t2.norm + t3.norm, t.start, t3.end))
+
+    for code, words in KEYWORDS_BY_CODE.items():
+        for kw in words:
+            kw_norm = _v3_norm_token(kw)
+            if not kw_norm:
+                continue
+            maxd = _v3_max_edit_distance_for(kw_norm)
+
+            for cand_norm, st, en in grams:
+                if not cand_norm:
+                    continue
+                if abs(len(cand_norm) - len(kw_norm)) > maxd:
+                    continue
+                d = _levenshtein(cand_norm, kw_norm, maxd)
+                if d <= maxd:
+                    key = (code, st, en)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    spans.append(TriggeredSpan(start=st, end=en, label=code, snippet=_v3_snippet(redacted, st, en)))
+    return spans
+
+
+def v3_detect_with_spans(text: str) -> Dict[str, Any]:
+    redacted = redact_text(text)
+
+    spans = _v3_regex_spans(redacted)
+    spans += _v3_fuzzy_spans(redacted)
+
+    uniq: Dict[tuple, TriggeredSpan] = {}
+    for s in spans:
+        uniq[(s.label, s.start, s.end)] = s
+    spans = list(uniq.values())
+    spans.sort(key=lambda x: (x.start, x.end))
+
+    commitment_types = sorted({s.label for s in spans})
+    severity = "HARD_COMMITMENT" if spans else "NONE"
+
+    weights = {
+        "FINANCIAL_COMMITMENT": 55,
+        "BILLING_CHANGE": 45,
+        "PRICING_CHANGE": 40,
+        "CONTRACTUAL_COMMITMENT": 60,
+        "TIMELINE_GUARANTEE": 35,
+    }
+    base = 0
+    for c in commitment_types:
+        base = max(base, weights.get(c, 25))
+    risk_score = max(0, min(int(base), 100))
+
+    return {
+        "redacted_text": redacted,
+        "triggered_spans": spans,
+        "commitment_types": commitment_types,
+        "severity": severity,
+        "risk_score": risk_score,
+    }
 
 
 # ----------------------------
@@ -699,10 +914,7 @@ def create_support_approval(payload: Dict[str, Any], api_key_hash: Optional[str]
 def _get_approval_row(approval_id: str) -> Optional[sqlite3.Row]:
     conn = _conn()
     try:
-        return conn.execute(
-            "SELECT * FROM approvals WHERE approval_id=? LIMIT 1",
-            (approval_id,),
-        ).fetchone()
+        return conn.execute("SELECT * FROM approvals WHERE approval_id=? LIMIT 1", (approval_id,)).fetchone()
     finally:
         conn.close()
 
@@ -725,7 +937,6 @@ def _find_latest_support_approval_by_ticket(ticket_id: str) -> Optional[sqlite3.
 # Email executor (Resend)
 # ----------------------------
 
-
 async def send_via_resend(req: MessageSendRequest) -> Dict[str, Any]:
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     if not api_key:
@@ -741,12 +952,7 @@ async def send_via_resend(req: MessageSendRequest) -> Dict[str, Any]:
     from_name = (req.from_name or os.getenv("DEFAULT_FROM_NAME", "Authority Gateway")).strip()
     from_value = f"{from_name} <{from_email}>"
 
-    payload = {
-        "from": from_value,
-        "to": [req.to],
-        "subject": req.subject,
-        "text": req.body,
-    }
+    payload = {"from": from_value, "to": [req.to], "subject": req.subject, "text": req.body}
 
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(
@@ -775,6 +981,169 @@ def health():
     }
 
 
+@app.post("/v3/support/decide", response_model=V3SupportDecideResponse)
+def v3_support_decide(req: V3SupportDecideRequest, request: Request):
+    audit_id = f"aud_{uuid.uuid4()}"
+
+    det = v3_detect_with_spans(req.draft.text)
+    decision = "ALLOW" if det["severity"] == "NONE" else "REQUIRE_APPROVAL"
+
+    commitment_types = det["commitment_types"]
+    risk_score = det["risk_score"]
+
+    policy_path: List[str] = []
+    approval_chain_preview: List[ApprovalChainStep] = []
+    if decision != "ALLOW":
+        policy_path = ["commitment_detection", "require_approval"]
+        approval_chain_preview = [
+            ApprovalChainStep(role="team_lead", eta_minutes=5),
+            ApprovalChainStep(role="manager", eta_minutes=15),
+        ]
+
+    reasons_models = [SupportReason(code=c, severity="HARD", evidence=[s.snippet for s in det["triggered_spans"]]) for c in commitment_types]
+    explainer = _decision_explainer(decision, reasons_models)
+
+    approval_id: Optional[str] = None
+    if decision != "ALLOW":
+        approval_payload = {
+            "type": "v3_support_message",
+            "env": req.env,
+            "ticket_id": req.ticket_id,
+            "channel": req.channel,
+            "actor_type": req.actor_type,
+            "redacted_text": det["redacted_text"],
+            "triggered_spans": [s.model_dump() for s in det["triggered_spans"]],
+            "commitment_types": commitment_types,
+            "risk_score": risk_score,
+            "policy_path": policy_path,
+            "approval_chain_preview": [s.model_dump() for s in approval_chain_preview],
+            "audit_id": audit_id,
+        }
+        approval_id = create_support_approval(approval_payload, api_key_hash=None)
+
+    audit(
+        event="v3_support_decide",
+        actor="v3_console",
+        env=req.env,
+        details={
+            "ticket_id": req.ticket_id,
+            "channel": req.channel,
+            "actor_type": req.actor_type,
+            "decision": decision,
+            "risk_score": risk_score,
+            "commitment_types": commitment_types,
+            "approval_id": approval_id,
+            "audit_id": audit_id,
+        },
+    )
+
+    return V3SupportDecideResponse(
+        decision=decision,
+        decision_explainer=explainer,
+        risk_score=risk_score,
+        commitment_types=commitment_types,
+        redacted_text=det["redacted_text"],
+        triggered_spans=det["triggered_spans"],
+        policy_path=policy_path,
+        approval_chain_preview=approval_chain_preview,
+        approval_id=approval_id,
+        audit_id=audit_id,
+    )
+
+
+@app.post("/v3/billing/refunds/decide", response_model=V3BillingRefundDecideResponse)
+def v3_billing_refund_decide(req: V3BillingRefundDecideRequest, request: Request):
+    audit_id = f"aud_{uuid.uuid4()}"
+
+    auto_allow_max = 0
+    human_required_above = 10_00
+
+    redacted_note = redact_text(req.note or "")
+
+    decision = "ALLOW"
+    policy_path: List[str] = ["refund_policy"]
+    approval_chain_preview: List[ApprovalChainStep] = []
+    risk_score = 70
+
+    if req.amount_cents >= human_required_above:
+        decision = "REQUIRE_APPROVAL"
+        policy_path = ["refund_policy", "threshold_check", "require_approval"]
+        approval_chain_preview = [ApprovalChainStep(role="billing_manager", eta_minutes=10)]
+        risk_score = 85
+    elif req.amount_cents > auto_allow_max:
+        decision = "REQUIRE_APPROVAL"
+        policy_path = ["refund_policy", "default_gate", "require_approval"]
+        approval_chain_preview = [ApprovalChainStep(role="team_lead", eta_minutes=5)]
+        risk_score = 75
+
+    spans: List[TriggeredSpan] = []
+    if decision != "ALLOW":
+        spans.append(
+            TriggeredSpan(
+                start=0,
+                end=min(len(redacted_note), 1),
+                label="FINANCIAL_COMMITMENT",
+                snippet="Refund requested (amount redacted)",
+            )
+        )
+
+    approval_id: Optional[str] = None
+    if decision != "ALLOW":
+        approval_payload = {
+            "type": "v3_billing_refund",
+            "env": req.env,
+            "ticket_id": req.ticket_id,
+            "actor_type": req.actor_type,
+            "charge_id": req.charge_id,
+            "customer_id": req.customer_id,
+            "amount_cents": req.amount_cents,
+            "currency": req.currency,
+            "redacted_text": redacted_note,
+            "triggered_spans": [s.model_dump() for s in spans],
+            "risk_score": risk_score,
+            "policy_path": policy_path,
+            "approval_chain_preview": [s.model_dump() for s in approval_chain_preview],
+            "audit_id": audit_id,
+        }
+        approval_id = create_support_approval(approval_payload, api_key_hash=None)
+
+    explainer = (
+        "Allowed: refund request is within configured policy."
+        if decision == "ALLOW"
+        else "Blocked: refund requires approval under configured policy."
+    )
+
+    audit(
+        event="v3_billing_refund_decide",
+        actor="v3_console",
+        env=req.env,
+        details={
+            "ticket_id": req.ticket_id,
+            "decision": decision,
+            "amount_cents": req.amount_cents,
+            "currency": req.currency,
+            "approval_id": approval_id,
+            "audit_id": audit_id,
+        },
+    )
+
+    return V3BillingRefundDecideResponse(
+        decision=decision,
+        decision_explainer=explainer,
+        risk_score=risk_score,
+        redacted_text=redacted_note,
+        triggered_spans=spans,
+        policy_path=policy_path,
+        approval_chain_preview=approval_chain_preview,
+        approval_id=approval_id,
+        audit_id=audit_id,
+    )
+
+
+# ----------------------------
+# Existing v1 + admin endpoints (UNCHANGED)
+# ----------------------------
+
 @app.post("/v1/keys/self_serve", response_model=SelfServeKeyResponse)
 def self_serve_issue_key(req: SelfServeKeyRequest, request: Request):
     client_ip = (request.client.host if request.client else "unknown").strip()
@@ -784,7 +1153,6 @@ def self_serve_issue_key(req: SelfServeKeyRequest, request: Request):
 
     ttl_days = int_env("SELF_SERVE_KEY_TTL_DAYS", 7)
 
-    # Hard constraints (Option A)
     key_prefix = "aia_dev"
     allowed_envs = "dev"
     requests_per_day = 200
@@ -795,13 +1163,7 @@ def self_serve_issue_key(req: SelfServeKeyRequest, request: Request):
     raw_key = f"{key_prefix}_{token}"
     key_hash = sha256_hex(raw_key)
 
-    notes_obj = {
-        "self_serve": True,
-        "email": req.email,
-        "company": req.company,
-        "source": req.source,
-        "ip": client_ip,
-    }
+    notes_obj = {"self_serve": True, "email": req.email, "company": req.company, "source": req.source, "ip": client_ip}
 
     conn = _conn()
     try:
@@ -901,12 +1263,7 @@ def revoke_key_endpoint(req: RevokeKeyRequest):
     finally:
         conn.close()
 
-    audit(
-        event="key_revoked",
-        actor="admin",
-        env=None,
-        details={"ok": ok, "key_hash_prefix": (req.key_hash or "")[:12]},
-    )
+    audit(event="key_revoked", actor="admin", env=None, details={"ok": ok, "key_hash_prefix": (req.key_hash or "")[:12]})
     return {"ok": ok}
 
 
@@ -946,12 +1303,7 @@ async def v1_messages_send(
     )
 
     if approval_mode == "simulate":
-        resp = {
-            "executed": False,
-            "mode": "simulate",
-            "commitment": commitment,
-            "note": "Simulated: no external side effects occurred.",
-        }
+        resp = {"executed": False, "mode": "simulate", "commitment": commitment, "note": "Simulated: no external side effects occurred."}
         if idempotency_key:
             idem_put(f"v1_messages_send::{idempotency_key}", "/v1/messages/send", resp)
         return resp
@@ -981,11 +1333,7 @@ async def v1_messages_send(
         resp = {
             "executed": False,
             "commitment": commitment,
-            "approval": {
-                "approval_mode": "require_human_approval",
-                "approval_id": approval_id,
-                "status": "PENDING",
-            },
+            "approval": {"approval_mode": "require_human_approval", "approval_id": approval_id, "status": "PENDING"},
             "note": "Pending human approval: message not sent.",
         }
         if idempotency_key:
@@ -1099,7 +1447,6 @@ def get_support_approval_status(
 
     payload = _parse_json(row["payload_json"])
     payload_type = payload.get("type")
-
     if payload_type != "support_message":
         raise HTTPException(status_code=400, detail="Approval is not a support_message type.")
 
@@ -1142,7 +1489,6 @@ def get_support_approval_by_ticket(
     row = _find_latest_support_approval_by_ticket(ticket_id)
     if not row:
         raise HTTPException(status_code=404, detail="No support approval found for this ticket.")
-
     approval_id = str(row["approval_id"])
     return get_support_approval_status(approval_id=approval_id, request=request, key_rec=key_rec, x_env=x_env)
 
@@ -1153,10 +1499,7 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
 
     conn = _conn()
     try:
-        row = conn.execute(
-            "SELECT * FROM approvals WHERE approval_id=? LIMIT 1",
-            (approval_id,),
-        ).fetchone()
+        row = conn.execute("SELECT * FROM approvals WHERE approval_id=? LIMIT 1", (approval_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Approval not found.")
 
@@ -1177,12 +1520,7 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
             )
             conn.commit()
 
-            audit(
-                event="approval_approved",
-                actor="admin",
-                env=env,
-                details={"approval_id": approval_id, "type": "message_send", "provider": result.get("provider")},
-            )
+            audit(event="approval_approved", actor="admin", env=env, details={"approval_id": approval_id, "type": "message_send", "provider": result.get("provider")})
 
             return {
                 "ok": True,
@@ -1201,12 +1539,7 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
             )
             conn.commit()
 
-            audit(
-                event="approval_approved",
-                actor="admin",
-                env=env,
-                details={"approval_id": approval_id, "type": "support_message"},
-            )
+            audit(event="approval_approved", actor="admin", env=env, details={"approval_id": approval_id, "type": "support_message"})
 
             return {
                 "ok": True,
@@ -1224,37 +1557,19 @@ async def approve(approval_id: str, x_env: Optional[str] = Header(default="dev",
         )
         conn.commit()
 
-        audit(
-            event="approval_approved",
-            actor="admin",
-            env=env,
-            details={"approval_id": approval_id, "type": "unknown"},
-        )
-        return {
-            "ok": True,
-            "approval_id": approval_id,
-            "status": "APPROVED",
-            "type": "unknown",
-            "note": "Approved unknown approval type. No execution performed.",
-        }
+        audit(event="approval_approved", actor="admin", env=env, details={"approval_id": approval_id, "type": "unknown"})
+        return {"ok": True, "approval_id": approval_id, "status": "APPROVED", "type": "unknown", "note": "Approved unknown approval type. No execution performed."}
     finally:
         conn.close()
 
 
 @app.post("/admin/approvals/{approval_id}/reject", dependencies=[Depends(require_admin)])
-def reject(
-    approval_id: str,
-    reason: Optional[str] = None,
-    x_env: Optional[str] = Header(default="dev", alias="X-Env"),
-):
+def reject(approval_id: str, reason: Optional[str] = None, x_env: Optional[str] = Header(default="dev", alias="X-Env")):
     env = (x_env or "dev").strip().lower()
 
     conn = _conn()
     try:
-        row = conn.execute(
-            "SELECT * FROM approvals WHERE approval_id=? LIMIT 1",
-            (approval_id,),
-        ).fetchone()
+        row = conn.execute("SELECT * FROM approvals WHERE approval_id=? LIMIT 1", (approval_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Approval not found.")
 
@@ -1267,13 +1582,7 @@ def reject(
         )
         conn.commit()
 
-        audit(
-            event="approval_rejected",
-            actor="admin",
-            env=env,
-            details={"approval_id": approval_id, "reason": reason or ""},
-        )
-
+        audit(event="approval_rejected", actor="admin", env=env, details={"approval_id": approval_id, "reason": reason or ""})
         return {"ok": True, "approval_id": approval_id, "status": "REJECTED", "reason": reason or ""}
     finally:
         conn.close()
@@ -1284,10 +1593,7 @@ def audit_recent(limit: int = 50):
     limit = max(1, min(int(limit), 200))
     conn = _conn()
     try:
-        rows = conn.execute(
-            "SELECT ts, event, actor, env, details_json FROM audit_log ORDER BY ts DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = conn.execute("SELECT ts, event, actor, env, details_json FROM audit_log ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
         out = []
         for r in rows:
             out.append(
