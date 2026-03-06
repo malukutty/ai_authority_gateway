@@ -36,12 +36,15 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
 
+from v4_api import router as v4_router
+
+
 # ----------------------------
 # App
 # ----------------------------
 
 app = FastAPI(title="Authority AI Gateway", version="0.6-path-b")
-
+app.include_router(v4_router)
 # ----------------------------
 # DB (SQLite)
 # ----------------------------

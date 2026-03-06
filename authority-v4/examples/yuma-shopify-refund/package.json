@@ -1,0 +1,13 @@
+{
+  "name": "yuma-shopify-refund-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --loader ts-node/esm src/index.ts"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}
