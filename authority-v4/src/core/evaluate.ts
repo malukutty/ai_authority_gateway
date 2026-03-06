@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { Commitment, Decision, ActorLane, Role } from "./types";
-import type { PolicyConfig } from "./policy";
+import type { Commitment, Decision, ActorLane, Role } from "./types.js";
+import type { PolicyConfig } from "./policy.js";
 
 function clampInt(n: number, min: number, max: number) {
   const x = Math.floor(Number.isFinite(n) ? n : 0);

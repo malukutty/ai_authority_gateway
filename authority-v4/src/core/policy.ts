@@ -1,4 +1,4 @@
-import type { ActorLane, CommitmentType } from "./types";
+import type { ActorLane, CommitmentType } from "./types.js";
 
 export interface LaneThreshold {
   autoExecuteUpTo: number;      // cents

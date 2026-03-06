@@ -3,10 +3,10 @@ import path from "node:path";
 import express from "express";
 import cors from "cors";
 import { z } from "zod";
-import { evaluate } from "./core/evaluate";
-import type { Commitment } from "./core/types";
-import type { PolicyConfig } from "./core/policy";
-import { writeAudit } from "./core/audit";
+import { evaluate } from "./core/evaluate.js";
+import type { Commitment } from "./core/types.js";
+import type { PolicyConfig } from "./core/policy.js";
+import { writeAudit } from "./core/audit.js";
 
 const app = express();
 

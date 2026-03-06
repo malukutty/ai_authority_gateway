@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { Commitment, Decision } from "./types";
+import type { Commitment, Decision } from "./types.js";
 
 export type AuditEvent = {
   ts: number;

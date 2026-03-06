@@ -1,7 +1,7 @@
-import type { Commitment } from "../../core/types";
-import type { PolicyConfig } from "../../core/policy";
-import { evaluate } from "../../core/evaluate";
-import { writeAudit } from "../../core/audit";
+import type { Commitment } from "../../core/types.js";
+import type { PolicyConfig } from "../../core/policy.js";
+import { evaluate } from "../../core/evaluate.js";
+import { writeAudit } from "../../core/audit.js";
 
 export async function authorityShopifyRefund(params: {
   shopDomain: string;
