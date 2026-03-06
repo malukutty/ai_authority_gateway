@@ -6,8 +6,7 @@
   "main": "dist/core/index.js",
   "types": "dist/core/index.d.ts",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "dev": "tsx watch src/server.ts",
+    "build": "node ./node_modules/typescript/bin/tsc -p tsconfig.json",    "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js"
   },
   "dependencies": {
