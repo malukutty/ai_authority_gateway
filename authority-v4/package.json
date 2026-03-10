@@ -11,8 +11,6 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
-    "@sentry/node": "^10.42.0",
-    "@sentry/profiling-node": "^10.42.0",
     "axios": "^1.13.6",
     "cors": "^2.8.6",
     "express": "^4.19.2",

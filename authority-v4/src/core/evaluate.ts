@@ -1,4 +1,3 @@
-import * as Sentry from "@sentry/node";
 import { randomUUID } from "node:crypto";
 import type { Commitment, Decision, ActorLane, Role } from "./types.js";
 import type { PolicyConfig } from "./policy.js";

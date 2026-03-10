@@ -1,6 +1,3 @@
-require("../instrument");
-
-import * as Sentry from "@sentry/node";
 import fs from "node:fs";
 import path from "node:path";
 import express from "express";
@@ -132,5 +129,5 @@ app.post("/v4/evaluate", (req, res) => {
 
 
 const port = Number(process.env.PORT || 8787);
-Sentry.setupExpressErrorHandler(app);
+
 app.listen(port, () => console.log(`authority-v4 listening on ${port}`));
