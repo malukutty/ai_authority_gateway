@@ -1,3 +1,4 @@
+import * as Sentry from "@sentry/node";
 import { randomUUID } from "node:crypto";
 import type { Commitment, Decision, ActorLane, Role } from "./types.js";
 import type { PolicyConfig } from "./policy.js";
@@ -38,81 +39,188 @@ function requiredRoleForAmount(
 }
 
 export function evaluate(commitment: Commitment, policy: PolicyConfig): Decision {
-  const decisionId = randomUUID();
-  const amountCents = clampInt(commitment.amountCents ?? 0, 0, 50_000_000);
+  return Sentry.startSpan(
+    {
+      name: "authority.evaluate",
+      op: "policy.decision",
+      attributes: {
+        "authority.commitment.type": commitment.type,
+        "authority.actor.lane": commitment.actorLane,
+        "authority.actor.role": commitment.role ?? "agent",
+      },
+    },
+    () => {
+      try {
+        const decisionId = randomUUID();
+        const amountCents = clampInt(commitment.amountCents ?? 0, 0, 50_000_000);
 
-  if (policy.killSwitch) {
-    return {
-      decisionId,
-      status: "deny",
-      riskScore: 100,
-      decisionExplainer: "Blocked: kill switch is enabled.",
-      policyPath: ["kill_switch"],
-      requiredApprovalChain: ["team_lead"],
-    };
-  }
+        Sentry.setContext("authority_commitment", {
+          decisionId,
+          type: commitment.type,
+          actorLane: commitment.actorLane,
+          actorRole: commitment.role ?? "agent",
+          amountCents,
+          customerId: commitment.customerId ?? null,
+          currency: commitment.currency ?? null,
+        });
 
-  if (policy.commitmentEnabled && policy.commitmentEnabled[commitment.type] === false) {
-    return {
-      decisionId,
-      status: "deny",
-      riskScore: 90,
-      decisionExplainer: `Blocked: commitment type '${commitment.type}' is disabled by policy.`,
-      policyPath: ["commitment_type_disabled"],
-      requiredApprovalChain: ["team_lead"],
-    };
-  }
+        Sentry.setContext("authority_policy", {
+          killSwitch: policy.killSwitch,
+          denyByDefault: policy.denyByDefault,
+          customerFlaggedHardStop: policy.hardStopRules?.customerFlagged ?? false,
+        });
 
-  if (policy.hardStopRules?.customerFlagged) {
-    return {
-      decisionId,
-      status: "escalate",
-      riskScore: 95,
-      decisionExplainer: "Escalated: customer is flagged. Requires review.",
-      policyPath: ["hard_stop", "customer_flagged"],
-      requiredApprovalChain: ["finance_manager"],
-    };
-  }
+        let decision: Decision;
 
-  const lane = commitment.actorLane;
-  const actorRole = commitment.role ?? "agent";
-  const required = requiredRoleForAmount(lane, amountCents, policy);
+        if (policy.killSwitch) {
+          decision = {
+            decisionId,
+            status: "deny",
+            riskScore: 100,
+            decisionExplainer: "Blocked: kill switch is enabled.",
+            policyPath: ["kill_switch"],
+            requiredApprovalChain: ["team_lead"],
+          };
 
-  if (!required) {
-    return {
-      decisionId,
-      status: "allow",
-      riskScore: 20,
-      decisionExplainer: "Allowed: within auto-execute threshold.",
-      policyPath: ["threshold_check", "allow"],
-      requiredApprovalChain: [],
-    };
-  }
+          Sentry.captureMessage("Authority policy denied action: kill switch enabled", {
+            level: "warning",
+          });
 
-  if (roleRank(actorRole) >= roleRank(required)) {
-    return {
-      decisionId,
-      status: "allow",
-      riskScore: 25,
-      decisionExplainer: `Allowed: actor role '${actorRole}' satisfies required role '${required}'.`,
-      policyPath: ["threshold_check", "role_satisfies", "allow"],
-      requiredApprovalChain: [],
-    };
-  }
+          Sentry.setContext("authority_decision", {
+            status: decision.status,
+            riskScore: decision.riskScore,
+            policyPath: decision.policyPath.join(" > "),
+            requiredApprovalChain: decision.requiredApprovalChain.join(" > "),
+          });
 
-  const chain: Role[] =
-    required === "director"
-      ? ["team_lead", "manager", "director"]
-      : required === "manager"
-        ? ["team_lead", "manager"]
-        : ["team_lead"];
+          return decision;
+        }
 
-  return {
-    decisionId,
-    status: "escalate",
-    riskScore: 75,
-    decisionExplainer: `Requires approval: amount exceeds lane threshold. Required role: ${required}.`,
-    policyPath: ["threshold_check", "require_approval"],
-    requiredApprovalChain: chain,
-  };
+        if (policy.commitmentEnabled && policy.commitmentEnabled[commitment.type] === false) {
+          decision = {
+            decisionId,
+            status: "deny",
+            riskScore: 90,
+            decisionExplainer: `Blocked: commitment type '${commitment.type}' is disabled by policy.`,
+            policyPath: ["commitment_type_disabled"],
+            requiredApprovalChain: ["team_lead"],
+          };
+
+          Sentry.captureMessage("Authority policy denied action: commitment type disabled", {
+            level: "warning",
+          });
+
+          Sentry.setContext("authority_decision", {
+            status: decision.status,
+            riskScore: decision.riskScore,
+            policyPath: decision.policyPath.join(" > "),
+            requiredApprovalChain: decision.requiredApprovalChain.join(" > "),
+          });
+
+          return decision;
+        }
+
+        if (policy.hardStopRules?.customerFlagged) {
+          decision = {
+            decisionId,
+            status: "escalate",
+            riskScore: 95,
+            decisionExplainer: "Escalated: customer is flagged. Requires review.",
+            policyPath: ["hard_stop", "customer_flagged"],
+            requiredApprovalChain: ["finance_manager"],
+          };
+
+          Sentry.captureMessage("Authority action escalated: flagged customer", {
+            level: "warning",
+          });
+
+          Sentry.setContext("authority_decision", {
+            status: decision.status,
+            riskScore: decision.riskScore,
+            policyPath: decision.policyPath.join(" > "),
+            requiredApprovalChain: decision.requiredApprovalChain.join(" > "),
+          });
+
+          return decision;
+        }
+
+        const lane = commitment.actorLane;
+        const actorRole = commitment.role ?? "agent";
+        const required = requiredRoleForAmount(lane, amountCents, policy);
+
+        if (!required) {
+          decision = {
+            decisionId,
+            status: "allow",
+            riskScore: 20,
+            decisionExplainer: "Allowed: within auto-execute threshold.",
+            policyPath: ["threshold_check", "allow"],
+            requiredApprovalChain: [],
+          };
+
+          Sentry.setContext("authority_decision", {
+            status: decision.status,
+            riskScore: decision.riskScore,
+            policyPath: decision.policyPath.join(" > "),
+            requiredApprovalChain: "",
+          });
+
+          return decision;
+        }
+
+        if (roleRank(actorRole) >= roleRank(required)) {
+          decision = {
+            decisionId,
+            status: "allow",
+            riskScore: 25,
+            decisionExplainer: `Allowed: actor role '${actorRole}' satisfies required role '${required}'.`,
+            policyPath: ["threshold_check", "role_satisfies", "allow"],
+            requiredApprovalChain: [],
+          };
+
+          Sentry.setContext("authority_decision", {
+            status: decision.status,
+            riskScore: decision.riskScore,
+            policyPath: decision.policyPath.join(" > "),
+            requiredApprovalChain: "",
+          });
+
+          return decision;
+        }
+
+        const chain: Role[] =
+          required === "director"
+            ? ["team_lead", "manager", "director"]
+            : required === "manager"
+              ? ["team_lead", "manager"]
+              : ["team_lead"];
+
+        decision = {
+          decisionId,
+          status: "escalate",
+          riskScore: 75,
+          decisionExplainer: `Requires approval: amount exceeds lane threshold. Required role: ${required}.`,
+          policyPath: ["threshold_check", "require_approval"],
+          requiredApprovalChain: chain,
+        };
+
+        Sentry.captureMessage("Authority action escalated: approval required", {
+          level: "warning",
+        });
+
+        Sentry.setContext("authority_decision", {
+          status: decision.status,
+          riskScore: decision.riskScore,
+          policyPath: decision.policyPath.join(" > "),
+          requiredApprovalChain: decision.requiredApprovalChain.join(" > "),
+          requiredRole: required,
+        });
+
+        return decision;
+      } catch (error) {
+        Sentry.captureException(error);
+        throw error;
+      }
+    }
+  );
 }
