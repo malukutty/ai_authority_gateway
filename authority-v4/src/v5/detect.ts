@@ -13,20 +13,30 @@ const CREDIT_PATTERNS = [
   /account credit/i,
   /apply credit/i,
   /store credit/i,
-  /offer .* credit/i
+  /offer .* credit/i,
+  /compensation/i
 ];
 
-const UNKNOWN_COMMITMENT_PATTERNS = [
+const WAIVER_PATTERNS = [
   /\bwaive\b/i,
-  /\bdiscount\b/i,
-  /billing adjustment/i,
-  /adjust the invoice/i,
-  /extend .*trial/i,
-  /extend .*subscription/i,
+  /\bwaiver\b/i,
+  /waive this invoice/i,
+  /waive the invoice/i,
+  /write\s*off/i,
+  /remove\s*charge/i,
+  /cancel\s*charge/i,
+  /adjust\s*invoice/i,
+  /billing adjustment/i
+];
+
+const PROMISE_PATTERNS = [
   /\bguarantee\b/i,
   /\bpromise\b/i,
-  /confirm .* by friday/i,
-  /confirm .* by monday/i
+  /confirm .* will/i,
+  /will be resolved by/i,
+  /will definitely be/i,
+  /assure you/i,
+  /ensure .* will/i
 ];
 
 function findEvidence(text: string, patterns: RegExp[]): string[] {
@@ -59,6 +69,7 @@ export function detectCommitment(
   customerMessage: string
 ): DetectedCommitment {
   const text = `${customerMessage}\n${assistantDraft}`;
+  const extractedAmount = extractAmountCents(text);
 
   const refundEvidence = findEvidence(text, REFUND_PATTERNS);
   if (refundEvidence.length > 0) {
@@ -66,7 +77,8 @@ export function detectCommitment(
       detected: true,
       type: "refund",
       evidencePhrases: refundEvidence,
-      amountCents: extractAmountCents(text),
+      amountCents: extractedAmount,
+      amountKnown: extractedAmount !== undefined,
       currency: "usd",
       confidence: 0.93
     };
@@ -78,21 +90,34 @@ export function detectCommitment(
       detected: true,
       type: "credit",
       evidencePhrases: creditEvidence,
-      amountCents: extractAmountCents(text),
+      amountCents: extractedAmount,
+      amountKnown: extractedAmount !== undefined,
       currency: "usd",
       confidence: 0.9
     };
   }
 
-  const unknownEvidence = findEvidence(text, UNKNOWN_COMMITMENT_PATTERNS);
-  if (unknownEvidence.length > 0) {
+  const waiverEvidence = findEvidence(text, WAIVER_PATTERNS);
+  if (waiverEvidence.length > 0) {
+    return {
+      detected: true,
+      type: "credit",
+      evidencePhrases: waiverEvidence,
+      amountCents: extractedAmount,
+      amountKnown: extractedAmount !== undefined,
+      currency: "usd",
+      confidence: 0.91
+    };
+  }
+
+  const promiseEvidence = findEvidence(text, PROMISE_PATTERNS);
+  if (promiseEvidence.length > 0) {
     return {
       detected: true,
       type: "unknown",
-      evidencePhrases: unknownEvidence,
-      amountCents: extractAmountCents(text),
-      currency: "usd",
-      confidence: 0.74
+      evidencePhrases: promiseEvidence,
+      amountKnown: false,
+      confidence: 0.82
     };
   }
 
@@ -100,6 +125,7 @@ export function detectCommitment(
     detected: false,
     type: "unknown",
     evidencePhrases: [],
+    amountKnown: false,
     confidence: 0.04
   };
-}
+} 

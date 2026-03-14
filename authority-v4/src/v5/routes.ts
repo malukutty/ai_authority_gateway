@@ -1,5 +1,3 @@
-
-
 import fs from "node:fs";
 import path from "node:path";
 import type { Express, Request, Response } from "express";
@@ -11,8 +9,9 @@ import { buildFinalCustomerReply } from "./respond.js";
 import { writeV5Audit } from "./audit.js";
 import { DEMO_SCENARIOS } from "./scenarios.js";
 import { evaluate } from "../core/evaluate.js";
-import type { Commitment, Role } from "../core/types.js";
+import type { Commitment, Decision, Role } from "../core/types.js";
 import type { PolicyConfig } from "../core/policy.js";
+import crypto from "node:crypto";
 
 const V5_AUDIT_PATH = process.env.AUTHORITY_V5_AUDIT_PATH || "./authority-v5.audit.jsonl";
 
@@ -77,6 +76,7 @@ type V5AuditRecord = {
     type?: "refund" | "credit" | "unknown";
     evidencePhrases?: string[];
     amountCents?: number;
+    amountKnown?: boolean;
     currency?: string;
     confidence?: number;
   } | null;
@@ -240,6 +240,36 @@ function buildV5Summary(events: V5AuditRecord[]) {
   };
 }
 
+function buildEscalateDecision(
+  reason: string,
+  policyPath: string[],
+  requiredApprovalChain: Role[] = ["team_lead", "manager"]
+): Decision {
+  return {
+    decisionId: crypto.randomUUID(),
+    status: "escalate",
+    riskScore: 75,
+    decisionExplainer: reason,
+    policyPath,
+    requiredApprovalChain
+  };
+}
+
+function shouldEscalateUnknownFinancialAmount(
+  detectedCommitment: { detected: boolean; type: "refund" | "credit" | "unknown"; amountKnown: boolean }
+): boolean {
+  if (!detectedCommitment.detected) return false;
+  if (detectedCommitment.type !== "refund" && detectedCommitment.type !== "credit") return false;
+  return !detectedCommitment.amountKnown;
+}
+
+function shouldEscalateUnknownCommitmentType(
+  detectedCommitment: { detected: boolean; type: "refund" | "credit" | "unknown" }
+): boolean {
+  if (!detectedCommitment.detected) return false;
+  return detectedCommitment.type === "unknown";
+}
+
 export function mountV5Routes(app: Express) {
   app.get("/v5/health", (_req: Request, res: Response) => {
     return res.json({ status: "ok", version: "v5" });
@@ -281,10 +311,21 @@ export function mountV5Routes(app: Express) {
       detected: detectedCommitment
     });
 
-    const decision =
-      detectedCommitment.detected && extractedCommitment
-        ? evaluate(extractedCommitment as Commitment, policy as PolicyConfig)
-        : null;
+    let decision: Decision | null = null;
+
+    if (shouldEscalateUnknownFinancialAmount(detectedCommitment)) {
+      decision = buildEscalateDecision(
+        "Requires approval: financial commitment detected but amount is unspecified.",
+        ["commitment_detected", "unknown_amount", "require_approval"]
+      );
+    } else if (shouldEscalateUnknownCommitmentType(detectedCommitment)) {
+      decision = buildEscalateDecision(
+        "Requires approval: commitment detected but type requires human review.",
+        ["commitment_detected", "unknown_type", "require_approval"]
+      );
+    } else if (detectedCommitment.detected && extractedCommitment) {
+      decision = evaluate(extractedCommitment as Commitment, policy as PolicyConfig);
+    }
 
     const finalCustomerReply = buildFinalCustomerReply({
       customerMessage,

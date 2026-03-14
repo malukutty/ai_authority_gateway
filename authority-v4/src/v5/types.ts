@@ -24,6 +24,7 @@ export interface DetectedCommitment {
   type: Commitment["type"];
   evidencePhrases: string[];
   amountCents?: number;
+  amountKnown: boolean;
   currency?: string;
   confidence: number;
 }
