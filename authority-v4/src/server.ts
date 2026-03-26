@@ -8,6 +8,7 @@ import type { Commitment } from "./core/types.js";
 import type { PolicyConfig } from "./core/policy.js";
 import { writeAudit } from "./core/audit.js";
 import { mountV5Routes } from "./v5/routes.js";
+import { mountV6Routes } from "./v6/routes.js";
 
 const app = express();
 
@@ -128,7 +129,8 @@ app.post("/v4/evaluate", (req, res) => {
   return res.json({ decision });
 });
 
-mountV5Routes(app);
+//mountV5Routes(app);
+mountV6Routes(app);
 
 const port = Number(process.env.PORT || 8787);
 app.listen(port, () => console.log(`authority-v4 listening on ${port}`));
