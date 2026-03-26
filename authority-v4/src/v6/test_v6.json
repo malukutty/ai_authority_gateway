@@ -1,0 +1,9 @@
+{
+  "model": "gpt-4o-mini",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain how to fix overdue task logic in a task manager app."
+    }
+  ]
+}
