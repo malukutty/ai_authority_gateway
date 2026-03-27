@@ -2,6 +2,7 @@ import type { Express, Request, Response } from "express";
 import { z } from "zod";
 import { getAgentSummaries, getPolicy, getRecentEvents, getSummary, setPolicy } from "./store.js";
 import { proxyProviderRequest } from "./proxy.js";
+import { maskAgentId, maskTaskId, maskTeamId, maskUserId } from "./mask.js";
 
 const PolicyPatchZ = z.object({
   agentDailyLimitUsd: z.number().positive().optional(),
@@ -10,33 +11,52 @@ const PolicyPatchZ = z.object({
   blockThresholdPct: z.number().min(1).max(100).optional()
 });
 
+function toMaskedEvent(event: any) {
+  return {
+    ...event,
+    agentId: maskAgentId(event.agentId),
+    taskId: maskTaskId(event.taskId),
+    userId: maskUserId(event.userId),
+    teamId: maskTeamId(event.teamId)
+  };
+}
+
+function toMaskedAgent(agent: any) {
+  return {
+    ...agent,
+    agentId: maskAgentId(agent.agentId),
+    teamId: maskTeamId(agent.teamId),
+    userId: maskUserId(agent.userId)
+  };
+}
+
 export function mountV6Routes(app: Express) {
   app.get("/v6/health", (_req: Request, res: Response) => {
     return res.json({ status: "ok", version: "v6" });
   });
 
+  // Public dashboard data
   app.get("/v6/metrics/summary", (_req: Request, res: Response) => {
     return res.json({
-      summary: getSummary(),
+      summary: getSummary({ visibility: "public" }),
       policy: getPolicy()
     });
   });
 
   app.get("/v6/metrics/agents", (_req: Request, res: Response) => {
-    return res.json({
-      agents: getAgentSummaries()
-    });
+    const agents = getAgentSummaries({ visibility: "public" }).map(toMaskedAgent);
+    return res.json({ agents });
   });
 
   app.get("/v6/events/recent", (req: Request, res: Response) => {
     const rawLimit = Number(req.query.limit ?? 50);
     const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(200, Math.floor(rawLimit))) : 50;
 
-    return res.json({
-      events: getRecentEvents(limit)
-    });
+    const events = getRecentEvents(limit, { visibility: "public" }).map(toMaskedEvent);
+    return res.json({ events });
   });
 
+  // Global fallback policy remains for now
   app.get("/v6/policy", (_req: Request, res: Response) => {
     return res.json({
       policy: getPolicy()
@@ -75,5 +95,28 @@ export function mountV6Routes(app: Express) {
         message: error instanceof Error ? error.message : "Unknown proxy error"
       });
     }
+  });
+
+  // Optional private endpoints for later frontend wiring
+  app.get("/v6/private/metrics/summary/:userId", (req: Request, res: Response) => {
+    return res.json({
+      summary: getSummary({ visibility: "private", ownerUserId: req.params.userId }),
+      policy: getPolicy()
+    });
+  });
+
+  app.get("/v6/private/metrics/agents/:userId", (req: Request, res: Response) => {
+    return res.json({
+      agents: getAgentSummaries({ visibility: "private", ownerUserId: req.params.userId })
+    });
+  });
+
+  app.get("/v6/private/events/recent/:userId", (req: Request, res: Response) => {
+    const rawLimit = Number(req.query.limit ?? 50);
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(200, Math.floor(rawLimit))) : 50;
+
+    return res.json({
+      events: getRecentEvents(limit, { visibility: "private", ownerUserId: req.params.userId })
+    });
   });
 } 

@@ -3,13 +3,13 @@ import {
   appendEvent,
   createEventId,
   getAgentSpendToday,
-  getPolicy,
   getTeamSpendToday
 } from "./store.js";
 import { calculateCostUsd, extractAnthropicUsage, extractOpenAIUsage } from "./cost.js";
 import { evaluateBudgetPolicy, getEventStatus } from "./policy.js";
 import { sendSlackAlert } from "./slack.js";
-import type { AttributionHeaders, Provider, UsageEvent } from "./types.js";
+import { lookupV6ApiKey } from "./keys.js";
+import type { AttributionHeaders, Provider, UsageEvent, V6ApiKeyRecord } from "./types.js";
 
 function requireAttributionHeaders(req: Request): AttributionHeaders {
   const agentId = String(req.header("x-agent-id") ?? "").trim();
@@ -22,6 +22,21 @@ function requireAttributionHeaders(req: Request): AttributionHeaders {
   }
 
   return { agentId, taskId, userId, teamId };
+}
+
+function requireV6ApiKey(req: Request): V6ApiKeyRecord {
+  const rawKey = String(req.header("x-v6-api-key") ?? "").trim();
+
+  if (!rawKey) {
+    throw new Error("Valid V6 API key required");
+  }
+
+  const record = lookupV6ApiKey(rawKey);
+  if (!record || !record.isActive) {
+    throw new Error("Valid V6 API key required");
+  }
+
+  return record;
 }
 
 function getProviderUrl(provider: Provider): string {
@@ -45,7 +60,7 @@ function getApiKey(provider: Provider): string {
 }
 
 function getModelFromRequest(provider: Provider, body: any): string {
-  if (provider === "openai") return String(body?.model ?? "unknown");
+  void provider;
   return String(body?.model ?? "unknown");
 }
 
@@ -79,18 +94,25 @@ export async function proxyProviderRequest(params: {
 }> {
   const { provider, req } = params;
   const attribution = requireAttributionHeaders(req);
-  const policy = getPolicy();
+  const keyRecord = requireV6ApiKey(req);
   const body = req.body;
   const model = getModelFromRequest(provider, body);
 
-  const currentAgentSpend = getAgentSpendToday(attribution.agentId);
-  const currentTeamSpend = getTeamSpendToday(attribution.teamId);
+  const currentAgentSpend = getAgentSpendToday(attribution.agentId, keyRecord.id);
+  const currentTeamSpend = getTeamSpendToday(attribution.teamId, keyRecord.id);
 
   const projectedAgentSpend = currentAgentSpend + estimatePreflightCostUsd(provider, model);
   const projectedTeamSpend = currentTeamSpend + estimatePreflightCostUsd(provider, model);
 
+  const effectivePolicy = {
+    agentDailyLimitUsd: keyRecord.dailySpendLimitUsd,
+    teamDailyLimitUsd: keyRecord.teamDailyLimitUsd,
+    alertThresholdPct: 80,
+    blockThresholdPct: 100
+  };
+
   const precheck = evaluateBudgetPolicy({
-    policy,
+    policy: effectivePolicy,
     projectedAgentSpendUsd: projectedAgentSpend,
     projectedTeamSpendUsd: projectedTeamSpend
   });
@@ -109,14 +131,17 @@ export async function proxyProviderRequest(params: {
       outputTokens: 0,
       costUsd: 0,
       status: "blocked",
-      reason: precheck.reason
+      reason: precheck.reason,
+      apiKeyId: keyRecord.id,
+      ownerUserId: keyRecord.userId,
+      visibility: keyRecord.visibility
     };
 
     appendEvent(blockedEvent);
 
     await sendSlackAlert({
       webhookUrl: process.env.SLACK_WEBHOOK_URL,
-      text: `🚫 V6 blocked request. Provider=${provider} agent=${attribution.agentId} team=${attribution.teamId} reason=${precheck.reason}`
+      text: `🚫 V6 blocked request. provider=${provider} key=${keyRecord.id} agent=${attribution.agentId} team=${attribution.teamId} reason=${precheck.reason}`
     });
 
     return {
@@ -153,7 +178,7 @@ export async function proxyProviderRequest(params: {
   const finalTeamSpend = currentTeamSpend + costUsd;
 
   const postcheck = evaluateBudgetPolicy({
-    policy,
+    policy: effectivePolicy,
     projectedAgentSpendUsd: finalAgentSpend,
     projectedTeamSpendUsd: finalTeamSpend
   });
@@ -176,7 +201,10 @@ export async function proxyProviderRequest(params: {
     outputTokens: usage.outputTokens,
     costUsd,
     status,
-    reason: postcheck.reason
+    reason: postcheck.reason,
+    apiKeyId: keyRecord.id,
+    ownerUserId: keyRecord.userId,
+    visibility: keyRecord.visibility
   };
 
   appendEvent(event);
@@ -184,7 +212,7 @@ export async function proxyProviderRequest(params: {
   if (postcheck.shouldAlert) {
     await sendSlackAlert({
       webhookUrl: process.env.SLACK_WEBHOOK_URL,
-      text: `⚠️ V6 alert. Provider=${provider} agent=${attribution.agentId} team=${attribution.teamId} spend=${costUsd.toFixed(4)} reason=${postcheck.reason}`
+      text: `⚠️ V6 alert. provider=${provider} key=${keyRecord.id} agent=${attribution.agentId} team=${attribution.teamId} spend=${costUsd.toFixed(4)} reason=${postcheck.reason}`
     });
   }
 

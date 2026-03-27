@@ -1,0 +1,13 @@
+[
+  {
+    "id": "b60f9edf-9df1-4a52-90ba-de269a76656c",
+    "userId": "bhavia",
+    "token": "v6_42e674f35537fb62d799fe672ea950c83b8f692087dd0814",
+    "keyPreview": "v6_42e674f...",
+    "visibility": "public",
+    "isActive": true,
+    "dailySpendLimitUsd": 2,
+    "teamDailyLimitUsd": 10,
+    "requestsPerMinute": 60
+  }
+]

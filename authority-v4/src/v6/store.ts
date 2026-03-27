@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import type { AgentSummary, BudgetPolicy, SpendSummary, UsageEvent } from "./types.js";
+import type { AgentSummary, BudgetPolicy, SpendSummary, UsageEvent, Visibility } from "./types.js";
 import { DEFAULT_POLICY } from "./policy.js";
 
 const V6_EVENTS_PATH = process.env.AUTHORITY_V6_EVENTS_PATH || "./authority-v6.events.jsonl";
@@ -65,20 +65,45 @@ export function readTodayEvents(now = new Date()): UsageEvent[] {
   return readAllEvents().filter((e) => isSameUtcDay(e.timestamp, now));
 }
 
-export function getAgentSpendToday(agentId: string): number {
+export function getAgentSpendToday(agentId: string, apiKeyId?: string): number {
   return readTodayEvents()
-    .filter((e) => e.agentId === agentId)
+    .filter((e) => e.agentId === agentId && (!apiKeyId || e.apiKeyId === apiKeyId))
     .reduce((sum, e) => sum + e.costUsd, 0);
 }
 
-export function getTeamSpendToday(teamId: string): number {
+export function getTeamSpendToday(teamId: string, apiKeyId?: string): number {
   return readTodayEvents()
-    .filter((e) => e.teamId === teamId)
+    .filter((e) => e.teamId === teamId && (!apiKeyId || e.apiKeyId === apiKeyId))
     .reduce((sum, e) => sum + e.costUsd, 0);
 }
 
-export function getSummary(): SpendSummary {
+function filterEventsForVisibility(params: {
+  visibility?: Visibility;
+  ownerUserId?: string;
+}): UsageEvent[] {
+  const { visibility, ownerUserId } = params;
   const events = readTodayEvents();
+
+  if (visibility === "public") {
+    return events.filter((e) => e.visibility === "public");
+  }
+
+  if (visibility === "private" && ownerUserId) {
+    return events.filter((e) => e.ownerUserId === ownerUserId);
+  }
+
+  return events;
+}
+
+export function getSummary(params?: {
+  visibility?: Visibility;
+  ownerUserId?: string;
+}): SpendSummary {
+  const events = filterEventsForVisibility({
+    visibility: params?.visibility,
+    ownerUserId: params?.ownerUserId
+  });
+
   const activeAgents = new Set(events.map((e) => e.agentId)).size;
   const teamsTracked = new Set(events.map((e) => e.teamId)).size;
 
@@ -91,8 +116,15 @@ export function getSummary(): SpendSummary {
   };
 }
 
-export function getAgentSummaries(): AgentSummary[] {
-  const events = readTodayEvents();
+export function getAgentSummaries(params?: {
+  visibility?: Visibility;
+  ownerUserId?: string;
+}): AgentSummary[] {
+  const events = filterEventsForVisibility({
+    visibility: params?.visibility,
+    ownerUserId: params?.ownerUserId
+  });
+
   const grouped = new Map<string, UsageEvent[]>();
 
   for (const event of events) {
@@ -120,6 +152,17 @@ export function getAgentSummaries(): AgentSummary[] {
   });
 }
 
-export function getRecentEvents(limit = 50): UsageEvent[] {
-  return readAllEvents().slice(-limit).reverse();
-}
+export function getRecentEvents(limit = 50, params?: {
+  visibility?: Visibility;
+  ownerUserId?: string;
+}): UsageEvent[] {
+  let events = readAllEvents();
+
+  if (params?.visibility === "public") {
+    events = events.filter((e) => e.visibility === "public");
+  } else if (params?.visibility === "private" && params.ownerUserId) {
+    events = events.filter((e) => e.ownerUserId === params.ownerUserId);
+  }
+
+  return events.slice(-limit).reverse();
+} 

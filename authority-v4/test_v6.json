@@ -3,7 +3,7 @@
   "messages": [
     {
       "role": "user",
-      "content": "Explain how to fix overdue task logic in a task manager app."
+      "content": "write a python function to reverse a string"
     }
   ]
 }

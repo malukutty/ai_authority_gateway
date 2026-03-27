@@ -1,5 +1,6 @@
 export type Provider = "openai" | "anthropic";
 export type EventStatus = "allowed" | "alerted" | "blocked";
+export type Visibility = "public" | "private";
 
 export interface AttributionHeaders {
   agentId: string;
@@ -22,6 +23,9 @@ export interface UsageEvent {
   costUsd: number;
   status: EventStatus;
   reason?: string;
+  apiKeyId?: string;
+  ownerUserId?: string;
+  visibility: Visibility;
 }
 
 export interface BudgetPolicy {
@@ -49,3 +53,14 @@ export interface AgentSummary {
   lastSeen: string;
   status: "active" | "limited" | "blocked";
 }
+
+export interface V6ApiKeyRecord {
+  id: string;
+  userId: string;
+  keyPreview?: string;
+  visibility: Visibility;
+  isActive: boolean;
+  dailySpendLimitUsd: number;
+  teamDailyLimitUsd: number;
+  requestsPerMinute?: number;
+} 
