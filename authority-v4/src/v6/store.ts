@@ -144,15 +144,17 @@ export function getAgentSummaries(params?: {
       );
 
       const first = sortedRows[0];
+      const latest = sortedRows[sortedRows.length - 1];
       const spendTotal = sortedRows.reduce((sum, e) => sum + e.costUsd, 0);
-      const blocked = sortedRows.some((e) => e.status === "blocked");
-      const alerted = sortedRows.some((e) => e.status === "alerted");
 
-      const status: AgentSummary["status"] = blocked
-        ? "blocked"
-        : alerted
-          ? "limited"
-          : "active";
+      let status: AgentSummary["status"];
+      if (latest.status === "blocked") {
+        status = "blocked";
+      } else if (latest.status === "alerted") {
+        status = "limited";
+      } else {
+        status = "active";
+      }
 
       return {
         agentId: first.agentId,
@@ -161,7 +163,7 @@ export function getAgentSummaries(params?: {
         requestCount: sortedRows.length,
         spendToday: Number(spendTotal.toFixed(6)),
         avgCostPerRequest: Number((spendTotal / sortedRows.length).toFixed(6)),
-        lastSeen: sortedRows[sortedRows.length - 1]?.timestamp ?? first.timestamp,
+        lastSeen: latest.timestamp,
         status
       };
     })
