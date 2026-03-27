@@ -1,7 +1,7 @@
 {
   "userId": "bhavia-public",
   "visibility": "public",
-  "dailySpendLimitUsd": 1,
-  "teamDailyLimitUsd": 2,
+  "dailySpendLimitUsd": 0.000000001,
+  "teamDailyLimitUsd": 0.00000001,
   "requestsPerMinute": 60
 }
