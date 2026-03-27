@@ -9,22 +9,51 @@ type StoredKeyRecord = V6ApiKeyRecord & {
   token: string;
 };
 
+const SEEDED_KEYS: StoredKeyRecord[] = [
+  {
+    id: "seed-public-key",
+    userId: "public-user",
+    token: "v6_test_public_key_123",
+    keyPreview: "v6_test_pu...",
+    visibility: "public",
+    isActive: true,
+    dailySpendLimitUsd: 1,
+    teamDailyLimitUsd: 2,
+    requestsPerMinute: 60
+  }
+];
+
 function resolvePath() {
   return path.resolve(V6_KEYS_PATH);
 }
 
+function dedupeKeys(keys: StoredKeyRecord[]): StoredKeyRecord[] {
+  const byToken = new Map<string, StoredKeyRecord>();
+  for (const key of keys) {
+    byToken.set(key.token, key);
+  }
+  return Array.from(byToken.values());
+}
+
 function readKeys(): StoredKeyRecord[] {
   const filePath = resolvePath();
-  if (!fs.existsSync(filePath)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8")) as StoredKeyRecord[];
-  } catch {
-    return [];
+
+  let fileKeys: StoredKeyRecord[] = [];
+
+  if (fs.existsSync(filePath)) {
+    try {
+      fileKeys = JSON.parse(fs.readFileSync(filePath, "utf8")) as StoredKeyRecord[];
+    } catch {
+      fileKeys = [];
+    }
   }
+
+  return dedupeKeys([...SEEDED_KEYS, ...fileKeys]);
 }
 
 function writeKeys(keys: StoredKeyRecord[]) {
-  fs.writeFileSync(resolvePath(), JSON.stringify(keys, null, 2), "utf8");
+  const filePath = resolvePath();
+  fs.writeFileSync(filePath, JSON.stringify(dedupeKeys(keys), null, 2), "utf8");
 }
 
 export function lookupV6ApiKey(rawToken: string): V6ApiKeyRecord | null {
@@ -43,6 +72,7 @@ export function createV6ApiKey(params: {
   requestsPerMinute?: number;
 }): { token: string; record: V6ApiKeyRecord } {
   const token = `v6_${crypto.randomBytes(24).toString("hex")}`;
+
   const record: StoredKeyRecord = {
     id: crypto.randomUUID(),
     userId: params.userId,
@@ -63,7 +93,20 @@ export function createV6ApiKey(params: {
   return { token, record: safe };
 }
 
-/**
- * Later, replace lookupV6ApiKey() with your real existing key store lookup.
- * Keep the returned shape the same so the rest of V6 does not change.
- */
+export function listV6ApiKeys(): V6ApiKeyRecord[] {
+  return readKeys().map(({ token: _token, ...safe }) => safe);
+}
+
+export function deactivateV6ApiKey(rawToken: string): boolean {
+  const keys = readKeys();
+  const index = keys.findIndex((k) => k.token === rawToken);
+  if (index === -1) return false;
+
+  keys[index] = {
+    ...keys[index],
+    isActive: false
+  };
+
+  writeKeys(keys);
+  return true;
+}
