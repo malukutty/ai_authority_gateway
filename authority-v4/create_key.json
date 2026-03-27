@@ -1,0 +1,7 @@
+{
+  "userId": "bhavia-private",
+  "visibility": "private",
+  "dailySpendLimitUsd": 1,
+  "teamDailyLimitUsd": 2,
+  "requestsPerMinute": 60
+}
