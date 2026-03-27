@@ -1,0 +1,6 @@
+{
+  "agentDailyLimitUsd": 0.00001,
+  "teamDailyLimitUsd": 0.00002,
+  "alertThresholdPct": 80,
+  "blockThresholdPct": 100
+}
