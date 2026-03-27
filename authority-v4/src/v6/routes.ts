@@ -36,20 +36,33 @@ const CreateKeyZ = z.object({
 
 function toMaskedEvent(event: any) {
   return {
-    ...event,
+    id: event.id,
+    timestamp: event.timestamp,
+    provider: event.provider,
+    model: event.model,
     agentId: maskAgentId(event.agentId),
     taskId: maskTaskId(event.taskId),
     userId: maskUserId(event.userId),
-    teamId: maskTeamId(event.teamId)
+    teamId: maskTeamId(event.teamId),
+    inputTokens: event.inputTokens,
+    outputTokens: event.outputTokens,
+    costUsd: event.costUsd,
+    status: event.status,
+    reason: event.reason,
+    visibility: event.visibility
   };
 }
 
 function toMaskedAgent(agent: any) {
   return {
-    ...agent,
     agentId: maskAgentId(agent.agentId),
     teamId: maskTeamId(agent.teamId),
-    userId: maskUserId(agent.userId)
+    userId: maskUserId(agent.userId),
+    requestCount: agent.requestCount,
+    spendToday: agent.spendToday,
+    avgCostPerRequest: agent.avgCostPerRequest,
+    lastSeen: agent.lastSeen,
+    status: agent.status
   };
 }
 
