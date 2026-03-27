@@ -46,17 +46,24 @@ function getProviderUrl(provider: Provider): string {
   return "https://api.anthropic.com/v1/messages";
 }
 
-function getApiKey(provider: Provider): string {
-  const key =
-    provider === "openai"
-      ? process.env.OPENAI_API_KEY
-      : process.env.ANTHROPIC_API_KEY;
-
-  if (!key) {
-    throw new Error(`${provider.toUpperCase()} API key is not configured`);
+function requireProviderApiKey(req: Request, provider: Provider): string {
+  if (provider === "openai") {
+    const key = String(req.header("x-openai-api-key") ?? "").trim();
+    if (!key) {
+      throw new Error("Missing required header: x-openai-api-key");
+    }
+    return key;
   }
 
-  return key;
+  if (provider === "anthropic") {
+    const key = String(req.header("x-anthropic-api-key") ?? "").trim();
+    if (!key) {
+      throw new Error("Missing required header: x-anthropic-api-key");
+    }
+    return key;
+  }
+
+  throw new Error(`Unsupported provider: ${provider}`);
 }
 
 function getModelFromRequest(provider: Provider, body: any): string {
@@ -95,6 +102,7 @@ export async function proxyProviderRequest(params: {
   const { provider, req } = params;
   const attribution = requireAttributionHeaders(req);
   const keyRecord = requireV6ApiKey(req);
+  const providerApiKey = requireProviderApiKey(req, provider);
   const body = req.body;
   const model = getModelFromRequest(provider, body);
 
@@ -153,10 +161,9 @@ export async function proxyProviderRequest(params: {
     };
   }
 
-  const apiKey = getApiKey(provider);
   const providerResponse = await fetch(getProviderUrl(provider), {
     method: "POST",
-    headers: buildProviderHeaders(provider, apiKey),
+    headers: buildProviderHeaders(provider, providerApiKey),
     body: JSON.stringify(body)
   });
 
