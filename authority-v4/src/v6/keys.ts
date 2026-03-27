@@ -3,36 +3,29 @@ import path from "node:path";
 import crypto from "node:crypto";
 import type { V6ApiKeyRecord, Visibility } from "./types.js";
 
-const V6_KEYS_PATH = process.env.AUTHORITY_V6_KEYS_PATH || "./authority-v6.keys.json";
+const V6_KEYS_PATH =
+  process.env.AUTHORITY_V6_KEYS_PATH || "./authority-v6.keys.json";
 
 type StoredKeyRecord = V6ApiKeyRecord & {
   token: string;
 };
 
-const SEEDED_KEYS: StoredKeyRecord[] = [
-  {
-    id: "seed-public-key",
-    userId: "public-user",
-    token: "v6_test_public_key_123",
-    keyPreview: "v6_test_pu...",
-    visibility: "public",
-    isActive: true,
-    dailySpendLimitUsd: 1,
-    teamDailyLimitUsd: 2,
-    requestsPerMinute: 60
-  }
-];
+/**
+* Seeded key for production testing.
+* IMPORTANT: Rotate or remove before public launch.
+*/
+const SEEDED_KEYS: StoredKeyRecord[] = [];
 
 function resolvePath() {
   return path.resolve(V6_KEYS_PATH);
 }
 
 function dedupeKeys(keys: StoredKeyRecord[]): StoredKeyRecord[] {
-  const byToken = new Map<string, StoredKeyRecord>();
+  const map = new Map<string, StoredKeyRecord>();
   for (const key of keys) {
-    byToken.set(key.token, key);
+    map.set(key.token, key);
   }
-  return Array.from(byToken.values());
+  return Array.from(map.values());
 }
 
 function readKeys(): StoredKeyRecord[] {
@@ -42,7 +35,9 @@ function readKeys(): StoredKeyRecord[] {
 
   if (fs.existsSync(filePath)) {
     try {
-      fileKeys = JSON.parse(fs.readFileSync(filePath, "utf8")) as StoredKeyRecord[];
+      fileKeys = JSON.parse(
+        fs.readFileSync(filePath, "utf8")
+      ) as StoredKeyRecord[];
     } catch {
       fileKeys = [];
     }
@@ -53,17 +48,32 @@ function readKeys(): StoredKeyRecord[] {
 
 function writeKeys(keys: StoredKeyRecord[]) {
   const filePath = resolvePath();
-  fs.writeFileSync(filePath, JSON.stringify(dedupeKeys(keys), null, 2), "utf8");
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify(dedupeKeys(keys), null, 2),
+    "utf8"
+  );
 }
 
-export function lookupV6ApiKey(rawToken: string): V6ApiKeyRecord | null {
-  const match = readKeys().find((k) => k.token === rawToken && k.isActive);
+/**
+* Lookup API key for request validation
+*/
+export function lookupV6ApiKey(
+  rawToken: string
+): V6ApiKeyRecord | null {
+  const match = readKeys().find(
+    (k) => k.token === rawToken && k.isActive
+  );
+
   if (!match) return null;
 
   const { token: _token, ...safe } = match;
   return safe;
 }
 
+/**
+* Create new V6 API key
+*/
 export function createV6ApiKey(params: {
   userId: string;
   visibility?: Visibility;
@@ -90,15 +100,39 @@ export function createV6ApiKey(params: {
   writeKeys(keys);
 
   const { token: _token, ...safe } = record;
-  return { token, record: safe };
+
+  return {
+    token,
+    record: safe
+  };
 }
 
+/**
+* List keys for a specific user (safe for UI)
+*/
+export function listV6ApiKeysByUser(
+  userId: string
+): V6ApiKeyRecord[] {
+  return readKeys()
+    .filter((k) => k.userId === userId)
+    .map(({ token: _token, ...safe }) => safe);
+}
+
+/**
+* List all keys (internal/admin only)
+*/
 export function listV6ApiKeys(): V6ApiKeyRecord[] {
   return readKeys().map(({ token: _token, ...safe }) => safe);
 }
 
-export function deactivateV6ApiKey(rawToken: string): boolean {
+/**
+* Deactivate a key
+*/
+export function deactivateV6ApiKey(
+  rawToken: string
+): boolean {
   const keys = readKeys();
+
   const index = keys.findIndex((k) => k.token === rawToken);
   if (index === -1) return false;
 
@@ -108,5 +142,6 @@ export function deactivateV6ApiKey(rawToken: string): boolean {
   };
 
   writeKeys(keys);
+
   return true;
 }

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getAgentSummaries, getPolicy, getRecentEvents, getSummary, setPolicy } from "./store.js";
 import { proxyProviderRequest } from "./proxy.js";
 import { maskAgentId, maskTaskId, maskTeamId, maskUserId } from "./mask.js";
+import { listV6ApiKeysByUser } from "./keys.js";
 
 const PolicyPatchZ = z.object({
   agentDailyLimitUsd: z.number().positive().optional(),
@@ -110,6 +111,12 @@ export function mountV6Routes(app: Express) {
       agents: getAgentSummaries({ visibility: "private", ownerUserId: req.params.userId })
     });
   });
+
+  app.get("/v6/keys/:userId", (req: Request, res: Response) => {
+  return res.json({
+    keys: listV6ApiKeysByUser(req.params.userId)
+  });
+});
 
   app.get("/v6/private/events/recent/:userId", (req: Request, res: Response) => {
     const rawLimit = Number(req.query.limit ?? 50);

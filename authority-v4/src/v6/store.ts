@@ -120,10 +120,13 @@ export function getAgentSummaries(params?: {
   visibility?: Visibility;
   ownerUserId?: string;
 }): AgentSummary[] {
-  const events = filterEventsForVisibility({
-    visibility: params?.visibility,
-    ownerUserId: params?.ownerUserId
-  });
+  let events = readAllEvents();
+
+  if (params?.visibility === "public") {
+    events = events.filter((e) => e.visibility === "public");
+  } else if (params?.visibility === "private" && params.ownerUserId) {
+    events = events.filter((e) => e.ownerUserId === params.ownerUserId);
+  }
 
   const grouped = new Map<string, UsageEvent[]>();
 
@@ -134,22 +137,35 @@ export function getAgentSummaries(params?: {
     grouped.set(key, bucket);
   }
 
-  return Array.from(grouped.values()).map((rows) => {
-    const first = rows[0];
-    const spendToday = rows.reduce((sum, e) => sum + e.costUsd, 0);
-    const blocked = rows.some((e) => e.status === "blocked");
-    const alerted = rows.some((e) => e.status === "alerted");
-    return {
-      agentId: first.agentId,
-      teamId: first.teamId,
-      userId: first.userId,
-      requestCount: rows.length,
-      spendToday: Number(spendToday.toFixed(6)),
-      avgCostPerRequest: Number((spendToday / rows.length).toFixed(6)),
-      lastSeen: rows[rows.length - 1]?.timestamp ?? first.timestamp,
-      status: blocked ? "blocked" : alerted ? "limited" : "active"
-    };
-  });
+  return Array.from(grouped.values())
+    .map((rows): AgentSummary => {
+      const sortedRows = [...rows].sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
+
+      const first = sortedRows[0];
+      const spendTotal = sortedRows.reduce((sum, e) => sum + e.costUsd, 0);
+      const blocked = sortedRows.some((e) => e.status === "blocked");
+      const alerted = sortedRows.some((e) => e.status === "alerted");
+
+      const status: AgentSummary["status"] = blocked
+        ? "blocked"
+        : alerted
+          ? "limited"
+          : "active";
+
+      return {
+        agentId: first.agentId,
+        teamId: first.teamId,
+        userId: first.userId,
+        requestCount: sortedRows.length,
+        spendToday: Number(spendTotal.toFixed(6)),
+        avgCostPerRequest: Number((spendTotal / sortedRows.length).toFixed(6)),
+        lastSeen: sortedRows[sortedRows.length - 1]?.timestamp ?? first.timestamp,
+        status
+      };
+    })
+    .sort((a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime());
 }
 
 export function getRecentEvents(limit = 50, params?: {
