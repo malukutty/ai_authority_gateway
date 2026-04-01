@@ -19,6 +19,8 @@ import {
   maskUserId
 } from "./mask.js";
 
+import { seedPublicBackfill, seedPublicTick } from "./seed.js";
+
 const PolicyPatchZ = z.object({
   agentDailyLimitUsd: z.number().positive().optional(),
   teamDailyLimitUsd: z.number().positive().optional(),
@@ -70,6 +72,25 @@ export function mountV6Routes(app: Express) {
   app.get("/v6/health", (_req: Request, res: Response) => {
     return res.json({ status: "ok", version: "v6" });
   });
+
+app.post("/v6/dev/seed-public", (req: Request, res: Response) => {
+    const secret = String(req.header("x-seed-secret") ?? "").trim();
+
+    if (!secret || secret !== process.env.SEED_SECRET) {
+      return res.status(403).json({ error: "unauthorized" });
+    }
+
+    const action = String(req.query.action ?? "tick").trim();
+
+    if (action === "backfill") {
+      const inserted = seedPublicBackfill(180);
+      return res.json({ ok: true, action, inserted });
+    }
+
+    const inserted = seedPublicTick(1, 3);
+    return res.json({ ok: true, action: "tick", inserted });
+  });
+
 
   // Public dashboard endpoints
   app.get("/v6/metrics/summary", (_req: Request, res: Response) => {
