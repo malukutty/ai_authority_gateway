@@ -8,10 +8,7 @@
   "scripts": {
     "build": "node ./node_modules/typescript/bin/tsc -p tsconfig.json",
     "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
-  "seed:v6:backfill": "tsx scripts/v6_seed_public_events.ts backfill",
-  "seed:v6:tick": "tsx scripts/v6_seed_public_events.ts tick"
-
+    "start": "node dist/server.js"
   },
   "dependencies": {
     "axios": "^1.13.6",
